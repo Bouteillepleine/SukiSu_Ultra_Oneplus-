@@ -72,7 +72,7 @@ on:
         options: [O2, O3]
         default: O2
       clean_build:
-        description: 'Clean build'
+        description: 'Clean build/No CCache'
         type: boolean
         default: false
 
