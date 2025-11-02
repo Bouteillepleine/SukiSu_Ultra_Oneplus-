@@ -1,0 +1,402 @@
+name: Build OnePlus Kernels_SukiSu Ultra
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      make_release:
+        description: 'Create release'
+        type: boolean
+        default: false
+      op_model:
+        description: 'Select kernels'
+        type: choice
+        options:
+          - ALL
+          - android15-6.6
+          - android14-6.1
+          - android14-5.15
+          - android13-5.15
+          - android13-5.10
+          - android12-5.10
+          - OP13-CPH
+          - OP13-PJZ
+          - OP13r
+          - OP13S
+          - OP13T
+          - OP12
+          - OP12r
+          - OP11
+          - OP11r
+          - OP10pro
+          - OP10t
+          - OP-Nord-5
+          - OP-NORD-4
+          - OP-NORD-4-CE
+          - OP-NORD-CE4-LITE
+          - OP-ACE-5-PRO
+          - OP-ACE-5
+          - OP-ACE-3-PRO
+          - OP-ACE-3V
+          - OP-ACE-2-PRO
+          - OP-ACE-2
+          - OP-OPEN
+          - OP-PAD-3
+          - OP-PAD-2-PRO
+          - OP-PAD-2
+          - OP-PAD-PRO
+        default: ALL
+      hook:
+        description: 'Hook type'
+        type: choice
+        options: [kprobe, manual, tracepoint]
+        default: manual
+      lsm:
+        description: 'BBG LSM'
+        type: boolean
+        default: false
+      sched:
+        description: 'Fengchi scheduler'
+        type: boolean
+        default: false
+      enable_zram:
+        description: 'ZRAM'
+        type: boolean
+        default: false
+      optimize_level:
+        description: 'Optimization'
+        type: choice
+        options: [O2, O3]
+        default: O2
+      clean_build:
+        description: 'Clean build'
+        type: boolean
+        default: false
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.result }}
+      device_count: ${{ steps.matrix.outputs.count }}
+    steps:
+      - name: 📥 Checkout configs
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: configs/
+
+      - name: 🔍 Generate build matrix
+        id: matrix
+        run: |
+          echo "::group::Matrix generation"
+          
+          [ ! -d configs ] && { echo "::error::configs/ not found"; exit 1; }
+          
+          echo "[" > matrix.json
+          first=true
+          for f in configs/*.json; do
+            jq empty "$f" 2>/dev/null || continue
+            [ "$first" = false ] && echo "," >> matrix.json
+            jq -c '.' "$f" >> matrix.json
+            first=false
+          done
+          echo "]" >> matrix.json
+          
+          input="${{ inputs.op_model }}"
+          echo "📋 Filter: $input"
+          
+          if [[ "$input" == "ALL" ]]; then
+            filter="."
+          elif [[ "$input" == android*-* ]]; then
+            av="${input%-*}"
+            kv="${input#*-}"
+            filter="map(select(.android_version==\"$av\" and .kernel_version==\"$kv\"))"
+          else
+            filter="map(select(.model==\"$input\"))"
+          fi
+          
+          result=$(jq -c "$filter" matrix.json)
+          count=$(jq 'length' <<<"$result")
+          
+          [ "$count" -eq 0 ] && { echo "::error::No matching devices"; exit 1; }
+          
+          echo "✅ Found $count device(s) to build"
+          echo ""
+          echo "Devices:"
+          jq -r '.[] | "  - \(.model) (\(.android_version)-\(.kernel_version))"' <<<"$result"
+          
+          echo "result=$(jq -cn --argjson i "$result" '{include:$i}')" >> $GITHUB_OUTPUT
+          echo "count=$count" >> $GITHUB_OUTPUT
+          
+          echo "::endgroup::"
+
+      - name: 📊 Build plan summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 🎯 Build Plan
+          
+          **Target:** \`${{ inputs.op_model }}\`  
+          **Devices:** ${{ steps.matrix.outputs.count }}  
+          **Configuration:**
+          - Hook: \`${{ inputs.hook }}\`
+          - Optimization: \`${{ inputs.optimize_level }}\`
+          - ZRAM: ${{ inputs.enable_zram }}
+          - BBG LSM: ${{ inputs.lsm }}
+          - Fengchi: ${{ inputs.sched }}
+          - Clean Build: ${{ inputs.clean_build }}
+          - Create Release: ${{ inputs.make_release }}
+          EOF
+
+  build:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔨 Build ${{ matrix.model }}
+        id: build
+        uses: ./.github/actions
+        with:
+          op_config_json: ${{ toJSON(matrix) }}
+          ksu_meta: 'susfs-main/⚡Ultra⚡/'
+          hook: ${{ inputs.hook }}
+          lsm: ${{ inputs.lsm }}
+          enable_zram: ${{ inputs.enable_zram }}
+          sched: ${{ inputs.sched }}
+          optimize_level: ${{ inputs.optimize_level }}
+          clean: ${{ inputs.clean_build }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📊 Build statistics
+        if: always()
+        run: |
+          echo "::group::Build Statistics"
+          
+          echo "Device: ${{ matrix.model }}"
+          echo "Status: ${{ job.status }}"
+          
+          if [ "${{ steps.build.outcome }}" = "success" ]; then
+            echo ""
+            echo "✅ Build completed successfully"
+            echo ""
+            echo "Outputs:"
+            echo "  - Kernel: ${{ steps.build.outputs.kernel_version }}"
+            echo "  - SukiSU: v${{ steps.build.outputs.sukisu_version }}"
+            echo "  - SUSFS: ${{ steps.build.outputs.susfs_version }}"
+            echo "  - Build time: ${{ steps.build.outputs.build_time }}s"
+            echo "  - ZIP: ${{ steps.build.outputs.zip_name }}"
+            echo "  - Size: $(numfmt --to=iec-i --suffix=B ${{ steps.build.outputs.zip_size }} 2>/dev/null || echo '${{ steps.build.outputs.zip_size }} bytes')"
+            
+            if [ "${{ inputs.clean_build }}" != "true" ]; then
+              echo "  - ccache hit rate: ${{ steps.build.outputs.ccache_hit_rate }}"
+            fi
+            
+            if [ -n "${{ steps.build.outputs.warnings_count }}" ]; then
+              echo "  - Warnings: ${{ steps.build.outputs.warnings_count }}"
+            fi
+          else
+            echo "❌ Build failed"
+          fi
+          
+          echo "::endgroup::"
+
+      - name: 📤 Upload kernel artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.model }}-kernel
+          path: ${{ matrix.model }}/artifacts/${{ steps.build.outputs.zip_name }}
+          retention-days: 30
+
+      - name: 📝 Job summary
+        if: always()
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          
+          ### ${{ matrix.model }} - ${{ job.status == 'success' && '✅ Success' || '❌ Failed' }}
+          
+          EOF
+          
+          if [ "${{ steps.build.outcome }}" = "success" ]; then
+            cat >> $GITHUB_STEP_SUMMARY << EOF
+          | Metric | Value |
+          |--------|-------|
+          | **Kernel** | ${{ steps.build.outputs.kernel_version }} |
+          | **SukiSU** | v${{ steps.build.outputs.sukisu_version }} |
+          | **SUSFS** | ${{ steps.build.outputs.susfs_version }} |
+          | **Build Time** | ${{ steps.build.outputs.build_time }}s |
+          | **ZIP Size** | $(numfmt --to=iec-i --suffix=B ${{ steps.build.outputs.zip_size }} 2>/dev/null || echo '${{ steps.build.outputs.zip_size }} bytes') |
+          EOF
+            
+            if [ "${{ inputs.clean_build }}" != "true" ]; then
+              echo "| **ccache Hit Rate** | ${{ steps.build.outputs.ccache_hit_rate }} |" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            if [ -n "${{ steps.build.outputs.warnings_count }}" ]; then
+              echo "| **Warnings** | ${{ steps.build.outputs.warnings_count }} |" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            cat >> $GITHUB_STEP_SUMMARY << EOF
+          
+          **Artifact:** \`${{ steps.build.outputs.zip_name }}\`  
+          **SHA256:** \`${{ steps.build.outputs.zip_sha256 }}\`
+          EOF
+          fi
+
+  release:
+    if: ${{ inputs.make_release }}
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🏷️ Generate release tag
+        id: tag
+        run: |
+          echo "::group::Tag generation"
+          
+          git fetch --tags
+          latest=$(git tag -l "v1.5.12-r*" | sort -V | tail -1)
+          
+          if [ -z "$latest" ]; then
+            tag="v1.5.12-r0"
+            echo "🆕 Creating initial tag: $tag"
+          else
+            rev=$(echo $latest | grep -oP 'r\K\d+')
+            tag="v1.5.12-r$((rev + 1))"
+            echo "📈 Incrementing from $latest to $tag"
+          fi
+          
+          echo "TAG=$tag" >> $GITHUB_ENV
+          echo "tag=$tag" >> $GITHUB_OUTPUT
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "Release $tag"
+          git push origin "$tag"
+          
+          echo "✅ Tag created and pushed"
+          echo "::endgroup::"
+
+      - name: 📥 Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 📦 Prepare release assets
+        id: prepare
+        run: |
+          echo "::group::Prepare release"
+          
+          mkdir release
+          find artifacts -name "*.zip" -exec cp {} release/ \;
+          
+          count=$(ls -1 release/*.zip 2>/dev/null | wc -l)
+          total_size=$(du -sb release | cut -f1)
+          
+          echo "📦 Prepared $count kernel(s)"
+          echo "📊 Total size: $(numfmt --to=iec-i --suffix=B $total_size)"
+          
+          echo "count=$count" >> $GITHUB_OUTPUT
+          echo "total_size=$total_size" >> $GITHUB_OUTPUT
+          
+          cat > notes.md << 'EOF'
+          # 🚀 SukiSU Ultra with SUSFS v1.5.12
+          
+          ## 📱 Built Devices
+          EOF
+          
+          for zip in release/*.zip; do
+            name=$(basename "$zip" .zip)
+            size=$(stat -c%s "$zip")
+            size_mb=$(echo "scale=2; $size / 1024 / 1024" | bc)
+            echo "- \`$name\` (${size_mb} MB)" >> notes.md
+          done
+          
+          cat >> notes.md << 'EOF'
+          
+          ## ✨ Features
+          - ⚡ **SukiSU Ultra Manager** - Advanced root management
+          - 🛡️ **SUSFS v1.5.12** - Enhanced security and hiding
+          - 🌐 **WireGuard** - Built-in VPN support
+          - 💾 **ZRAM** - Memory compression (optional)
+          - 🔧 **BBG LSM** - Baseband Guard security (optional)
+          - 🚀 **Optimized Build** - O2/O3 compiler optimizations
+          
+          ## 📥 Installation
+          1. Download the ZIP for your device
+          2. Flash with SukiSU Manager or custom recovery
+          3. Reboot and enjoy!
+          
+          ## 🔗 Links
+          - [SUSFS Module](https://github.com/sidex15/ksu_module_susfs)
+          - [SukiSU Manager](https://github.com/SukiSU-Ultra/SukiSU-Ultra)
+          - [Report Issues](https://github.com/${{ github.repository }}/issues)
+          
+          ## 📊 Build Info
+          - **Built on:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          - **Workflow:** ${{ github.workflow }}
+          - **Run:** [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          EOF
+          
+          echo "::endgroup::"
+
+      - name: 🚀 Create GitHub release
+        id: release
+        run: |
+          echo "::group::Create release"
+          
+          gh release create "$TAG" \
+            --title "🎯 OnePlus Kernels - SukiSU Ultra $TAG" \
+            --notes-file notes.md \
+            --prerelease \
+            release/*.zip
+          
+          echo "✅ Release created: $TAG"
+          echo "🔗 URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG"
+          
+          echo "::endgroup::"
+
+      - name: 📝 Release summary
+        if: success()
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          
+          ---
+          
+          ## 🎉 Release Created Successfully
+          
+          **Tag:** [\`${{ steps.tag.outputs.tag }}\`](${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ steps.tag.outputs.tag }})  
+          **Kernels:** ${{ steps.prepare.outputs.count }}  
+          **Total Size:** $(numfmt --to=iec-i --suffix=B ${{ steps.prepare.outputs.total_size }})
+          
+          ### 📦 Assets
+          EOF
+          
+          for zip in release/*.zip; do
+            name=$(basename "$zip")
+            size=$(stat -c%s "$zip")
+            size_mb=$(echo "scale=2; $size / 1024 / 1024" | bc)
+            echo "- \`$name\` (${size_mb} MB)" >> $GITHUB_STEP_SUMMARY
+          done
+
+      - name: 🧹 Cleanup on failure
+        if: failure()
+        run: |
+          echo "::group::Cleanup failed release"
+          git push origin --delete "$TAG" 2>/dev/null || true
+          git tag -d "$TAG" 2>/dev/null || true
+          echo "✅ Cleanup completed"
+          echo "::endgroup::"
