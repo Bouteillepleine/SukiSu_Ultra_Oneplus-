@@ -1463,67 +1463,48 @@ runs:
       shell: bash
       run: |
         set -e
-        echo "🔍 Searching for zram.ko module..."
+        echo "::group::Package ZRAM module"
         
-        # Search paths in priority order
+        # 1. Download template package first
+        echo "Downloading ZRAM module template..."
+        download_url=$(curl -s https://api.github.com/repos/Bouteillepleine/ZRAM-Module/releases/latest | \
+          grep "browser_download_url" | grep "ZRAM-Module-.*\.zip" | cut -d '"' -f 4 | head -n 1)
+        
+        if [ -n "$download_url" ]; then
+          wget -N "$download_url"
+          unzip -q "$(ls -t ZRAM-Module-*.zip | head -1)" -d ZRAM-Module
+          echo "✅ Template downloaded"
+        else
+          echo "⚠️ Failed to download template"
+          echo "upload=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        
+        # 2. Search for built module (your original logic)
         SEARCH_PATHS=(
           "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/common/out/drivers/block/zram/zram.ko"
           "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/out/*/drivers/block/zram/zram.ko"
-          "$GITHUB_WORKSPACE/$CONFIG/device/qcom/*/kernel/drivers/block/zram/zram.ko"
         )
         
         ZRAM_FOUND=false
-        ZRAM_SOURCE=""
-        
         for pattern in "${SEARCH_PATHS[@]}"; do
           for file in $pattern; do
             if [ -f "$file" ]; then
-              ZRAM_SOURCE="$file"
+              # 3. Replace template module with built one
+              cp "$file" "./ZRAM-Module/zram/zram.ko"
               ZRAM_FOUND=true
+              echo "✅ Using built module: $file"
               break 2
             fi
           done
         done
         
         if [ "$ZRAM_FOUND" = false ]; then
-          echo "⚠️ ZRAM module not found in standard paths"
-          echo "Performing full workspace search..."
-          ZRAM_SOURCE=$(find "$GITHUB_WORKSPACE/$CONFIG" -type f -name "zram.ko" 2>/dev/null | head -n 1)
-          
-          if [ -z "$ZRAM_SOURCE" ]; then
-            echo "❌ ZRAM module not found"
-            echo "Possible reasons:"
-            echo "  1. CONFIG_ZRAM=y (built-in, not a module)"
-            echo "  2. Build failed before module compilation"
-            echo "  3. Unsupported kernel version"
-            echo "upload=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          echo "⚠️ Using template module (built-in ZRAM detected)"
         fi
         
-        echo "✅ Found zram.ko at: $ZRAM_SOURCE"
-        ZRAM_SIZE=$(stat -c%s "$ZRAM_SOURCE")
-        echo "   Size: $(numfmt --to=iec-i --suffix=B "$ZRAM_SIZE")"
-        
-        # Create simple package directory
-        MODULE_PKG_DIR="$GITHUB_WORKSPACE/ZRAM-Module"
-        mkdir -p "$MODULE_PKG_DIR"
-        
-        # Copy module only
-        cp "$ZRAM_SOURCE" "$MODULE_PKG_DIR/zram.ko"
-        
-        # Create minimal info file
-        cat > "$MODULE_PKG_DIR/module-info.txt" << EOF
-        Device: ${{ env.OP_MODEL }}
-        Kernel: ${{ env.TKERNEL_VER }}
-        Android: ${{ env.ANDROID_VER }}
-        Size: $(numfmt --to=iec-i --suffix=B "$ZRAM_SIZE")
-        Build: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-        SHA256: $(sha256sum "$ZRAM_SOURCE" | awk '{print $1}')
-        EOF
-        
         echo "upload=true" >> "$GITHUB_OUTPUT"
-        echo "✅ ZRAM module packaged"   
+        echo "::endgroup::"
 
     - name: Download SUSFS Module from CI
       shell: bash
