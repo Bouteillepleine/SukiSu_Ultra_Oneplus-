@@ -1,65 +1,66 @@
 name: 'Build OnePlus Kernel with SukiSU Ultra'
+description: 'Composite action to build OnePlus kernels with SukiSU Ultra, SUSFS, and optional features like ZRAM, BBG LSM, and Fengchi scheduler'
 
 inputs:
   op_config_json:
-    description: 'JSON string containing full device config'
+    description: 'JSON string containing full device config (model, soc, branch, manifest)'
     required: true
   ksu_meta:
-    description: 'SukiSU Ultra metadata (branch/tag/hash)'
+    description: 'SukiSU Ultra metadata in format: branch/custom_tag/commit_hash'
     required: false
     default: 'susfs-main/⚡Ultra⚡/'
   hook:
-    description: 'Hook type (kprobe/manual/tracepoint)'
+    description: 'Hook type: kprobe (default), manual, or tracepoint'
     required: false
     default: 'manual'
   lsm:
-    description: 'Enable Baseband Guard LSM (true/false)'
+    description: 'Enable Baseband Guard LSM security module'
     required: false
     default: 'false'
   enable_zram:
-    description: 'Enable ZRAM with advanced compressors (true/false)'
+    description: 'Enable ZRAM with advanced compressors (LZ4K, LZ4KD, etc.)'
     required: false
     default: 'false'
   sched:
-    description: 'Enable Fengchi scheduler (true/false) - 6.6 kernels only'
+    description: 'Enable Fengchi scheduler (6.6 kernels only)'
     required: false
     default: 'false'
   optimize_level:
-    description: 'Optimization level (O2/O3)'
+    description: 'Compiler optimization level: O2 (balanced) or O3 (aggressive)'
     required: false
     default: 'O2'
   clean:
-    description: 'Build with no ccache (true/false) - disables ccache'
+    description: 'Force clean build without ccache acceleration'
     required: false
     default: 'false'
   github_token:
-    description: 'GitHub token for API access'
+    description: 'GitHub token for API access (SUSFS module download)'
     required: true
     
 outputs:
   kernel_version:
-    description: 'Built kernel version'
+    description: 'Built kernel version (e.g., android14-6.1.75)'
     value: ${{ steps.save_metadata.outputs.kernel_version }}
   sukisu_version:
-    description: 'SukiSU version'
+    description: 'SukiSU manager version number'
     value: ${{ steps.save_metadata.outputs.sukisu_version }}
   susfs_version:
-    description: 'SUSFS version'
+    description: 'SUSFS version string'
     value: ${{ steps.save_metadata.outputs.susfs_version }}
   image_sha256:
-    description: 'Kernel image SHA256'
+    description: 'SHA256 hash of kernel Image'
     value: ${{ steps.collect_stats.outputs.image_sha256 }}
   zip_name:
-    description: 'Created ZIP filename'
+    description: 'Flashable ZIP filename'
     value: ${{ steps.create_zip.outputs.zip_name }}
   zip_sha256:
-    description: 'ZIP file SHA256'
+    description: 'SHA256 hash of flashable ZIP'
     value: ${{ steps.create_zip.outputs.zip_sha256 }}
   zip_size:
     description: 'ZIP file size in bytes'
     value: ${{ steps.create_zip.outputs.zip_size }}
   build_time:
-    description: 'Build time in seconds'
+    description: 'Total build time in seconds'
     value: ${{ steps.collect_stats.outputs.build_time }}
   ccache_hit_rate:
     description: 'ccache hit rate percentage'
@@ -68,12 +69,13 @@ outputs:
     description: 'ccache direct hit rate percentage'
     value: ${{ steps.ccache_stats.outputs.direct_rate }}
   warnings_count:
-    description: 'Build warnings count'
+    description: 'Number of compiler warnings'
     value: ${{ steps.collect_stats.outputs.warnings_count }}
 
 runs:
-  using: 'composite'  
+  using: 'composite'
   steps:
+    
     - name: Parse op_config_json
       shell: bash
       run: |
@@ -179,7 +181,6 @@ runs:
         fi
         echo "::endgroup::"
 
-    # ✅ FIXED: Now uses $OP_BRANCH for remote manifests
     - name: Initialize and Sync Kernel Source
       shell: bash
       run: |
@@ -194,12 +195,10 @@ runs:
           mkdir -p .repo/manifests
           curl --fail --show-error --location --proto '=https' "$OP_MANIFEST" -o .repo/manifests/temp_manifest.xml
           
-          # ✅ CRITICAL FIX: Use $OP_BRANCH instead of hardcoded branch
           "$REPO" init -u https://github.com/OnePlusOSS/kernel_manifest.git \
             -b "$OP_BRANCH" \
             -m temp_manifest.xml --repo-rev=v2.16 --depth=1 --no-clone-bundle --no-tags
         else
-          # ✅ Already correct: Uses $OP_BRANCH for local manifests
           "$REPO" init -u https://github.com/OnePlusOSS/kernel_manifest.git \
             -b "$OP_BRANCH" \
             -m "$OP_MANIFEST" --repo-rev=v2.16 --depth=1 --no-clone-bundle --no-tags
@@ -430,7 +429,7 @@ runs:
           echo "✅ Restored cache found"
           echo ""
           echo "Pre-build cache statistics:"
-          ccache -s || true
+          ccache -s | head -n 20
         else
           echo "⚠️ No existing cache - building from scratch"
           echo "Cache will be populated for future builds"
@@ -949,7 +948,6 @@ runs:
         
         echo "::endgroup::"      
    
-    # ✅ FIXED: Removed CONFIG_ZRAM=m (relies on base defconfig)
     - name: Configure Kernel
       shell: bash
       run: |
@@ -1045,7 +1043,6 @@ runs:
         CONFIG_OPTIMIZE_INLINING=y
         EOF
 
-        # ✅ CRITICAL FIX: Don't set CONFIG_ZRAM (base defconfig has it)
         if [ "${{ inputs.enable_zram }}" = "true" ]; then
           cat >> "$CONFIG_FILE" << 'EOF'
         CONFIG_CRYPTO_LZ4HC=y
@@ -1084,7 +1081,7 @@ runs:
         KERNEL_PATH="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
         cd "$KERNEL_PATH/common"
         mkdir -p out
-        CUSTOM_LOCALVERSION="-${{ env.ANDROID_VER }}-OP-UltraBolt"
+        CUSTOM_LOCALVERSION="-${{ env.ANDROID_VER }}-OP-⚡UltraBolt⚡"
         echo "CUSTOM_LOCALVERSION=$CUSTOM_LOCALVERSION" >> "$GITHUB_ENV"
         echo "Kernel branding: $CUSTOM_LOCALVERSION"    
 
@@ -1103,7 +1100,6 @@ runs:
         
         export PYTHONWARNINGS="${PYTHONWARNINGS}"
         
-        # ✅ Use today's date at midnight UTC for reproducibility
         TODAY_MIDNIGHT=$(date -u -d "$(date -u '+%Y-%m-%d') 00:00:00" +%s)
         export SOURCE_DATE_EPOCH=$TODAY_MIDNIGHT
         export KBUILD_BUILD_TIMESTAMP="$(date -u -d @${TODAY_MIDNIGHT} '+%Y-%m-%d %H:%M:%S UTC')"
@@ -1240,7 +1236,7 @@ runs:
         IMG="$OUT/arch/arm64/boot/Image"
         if [ ! -f "$IMG" ]; then
           echo "::error::Kernel Image missing"
-          echo "::group::Last 100 lines of build log"
+                    echo "::group::Last 100 lines of build log"
           tail -n 100 build.log || echo "Build log not available"
           echo "::endgroup::"
           exit 1
@@ -1461,53 +1457,72 @@ runs:
         echo "   - SHA256: $IMG_SHA256"
         echo "   - Build time: ${BUILD_TIME}s"
     
-    - name: Package ZRAM Module
+    - name: Download and Package ZRAM Module
       if: ${{ inputs.enable_zram == 'true' }}
-      id: zram_package
+      id: zram_find
       shell: bash
+      continue-on-error: true
       run: |
         set -e
-        echo "::group::Package ZRAM module"
-        
-        # 1. Download template package first
-        echo "Downloading ZRAM module template..."
-        download_url=$(curl -s https://api.github.com/repos/Bouteillepleine/ZRAM-Module/releases/latest | \
-          grep "browser_download_url" | grep "ZRAM-Module-.*\.zip" | cut -d '"' -f 4 | head -n 1)
-        
-        if [ -n "$download_url" ]; then
-          wget -N "$download_url"
-          unzip -q "$(ls -t ZRAM-Module-*.zip | head -1)" -d ZRAM-Module
-          echo "✅ Template downloaded"
-        else
-          echo "⚠️ Failed to download template"
+        echo "::group::Download and package ZRAM module"
+        echo "Fetching ZRAM module ZIP download link..."
+        retries=3
+        success=0
+        for i in $(seq 1 $retries); do
+          echo "Attempt $i of $retries..."
+          download_url=$(curl -s https://api.github.com/repos/Bouteillepleine/ZRAM-Module/releases/latest | \
+            grep "browser_download_url" | grep "ZRAM-Module-.*\.zip" | cut -d '"' -f 4 | head -n 1)
+    
+          if [ -n "$download_url" ]; then
+            echo "Successfully retrieved download link: $download_url"
+            wget -N "$download_url" && success=1 && break
+          else
+            echo "Failed to get download link, retrying in 3 seconds..."
+            sleep 3
+          fi
+        done
+    
+        if [ "$success" -ne 1 ]; then
+          echo "Failed to retrieve ZRAM module download link after $retries attempts"
           echo "upload=false" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
           exit 0
         fi
+    
+        unzip "$(ls -t ZRAM-Module-*.zip | head -1)" -d ZRAM-Module
+        target="./ZRAM-Module/zram/zram.ko"
         
-        # 2. Search for built module (your original logic)
-        SEARCH_PATHS=(
-          "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/common/out/drivers/block/zram/zram.ko"
-          "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/out/*/drivers/block/zram/zram.ko"
+        echo "Searching for zram.ko module file..."
+        search_paths=(
+          "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/common/out"
+          "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/out"
+          "$GITHUB_WORKSPACE/$CONFIG/device/qcom"
         )
         
-        ZRAM_FOUND=false
-        for pattern in "${SEARCH_PATHS[@]}"; do
-          for file in $pattern; do
-            if [ -f "$file" ]; then
-              # 3. Replace template module with built one
-              cp "$file" "./ZRAM-Module/zram/zram.ko"
-              ZRAM_FOUND=true
-              echo "✅ Using built module: $file"
-              break 2
-            fi
-          done
+        zram_path=""
+        for path in "${search_paths[@]}"; do
+          zram_path=$(find "$path" -type f -name "zram.ko" 2>/dev/null | head -n 1)
+          [ -n "$zram_path" ] && break
         done
         
-        if [ "$ZRAM_FOUND" = false ]; then
-          echo "⚠️ Using template module (built-in ZRAM detected)"
+        if [ -z "$zram_path" ]; then
+          zram_path=$(find "$GITHUB_WORKSPACE/$CONFIG" -type f -name "zram.ko" 2>/dev/null | head -n 1)
         fi
         
-        echo "upload=true" >> "$GITHUB_OUTPUT"
+        if [ -n "$zram_path" ] && [ -f "$zram_path" ]; then
+          echo "✅ ZRAM module found at: $zram_path"
+          mkdir -p "$(dirname "$target")"
+          if [ "$(realpath "$zram_path")" != "$(realpath "$target")" ]; then
+            cp "$zram_path" "$target"
+            echo "✅ ZRAM module copied to package"
+          else
+            echo "ℹ️ Source and target are the same, skipping copy"
+          fi
+          echo "upload=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "⚠️ zram.ko file not found in build output (may be built-in)"
+          echo "upload=false" >> "$GITHUB_OUTPUT"
+        fi
         echo "::endgroup::"
 
     - name: Download SUSFS Module from CI
@@ -1643,7 +1658,7 @@ runs:
         echo "::endgroup::"
 
     - name: Upload ZRAM Module
-      if: ${{ inputs.enable_zram == 'true' && steps.zram_package.outputs.upload == 'true' }}
+      if: ${{ inputs.enable_zram == 'true' && steps.zram_find.outputs.upload == 'true' }}
       uses: actions/upload-artifact@v4
       with:
         name: ZRAM-Module_${{ env.KERNEL_VER }}_${{ env.OP_MODEL }}
@@ -1716,7 +1731,7 @@ runs:
         
         if [ "${{ inputs.enable_zram }}" = "true" ]; then
           echo "### 🔧 ZRAM Module" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ steps.zram_package.outputs.upload }}" = "true" ]; then
+          if [ "${{ steps.zram_find.outputs.upload }}" = "true" ]; then
             echo "- ✅ **Status:** Available" >> $GITHUB_STEP_SUMMARY
             echo "- 📦 **Artifact:** ZRAM-Module_${KERNEL_VER}_${OP_MODEL}" >> $GITHUB_STEP_SUMMARY
           else
