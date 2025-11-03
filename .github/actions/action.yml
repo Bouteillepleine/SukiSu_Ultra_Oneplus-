@@ -1,5 +1,4 @@
 name: 'Build OnePlus Kernel with SukiSU Ultra'
-description: 'Composite action to build OnePlus kernels with SukiSU Ultra, SUSFS, and optional features like ZRAM, BBG LSM, and Fengchi scheduler'
 
 inputs:
   op_config_json:
