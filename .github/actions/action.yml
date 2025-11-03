@@ -1080,7 +1080,7 @@ runs:
         KERNEL_PATH="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
         cd "$KERNEL_PATH/common"
         mkdir -p out
-        CUSTOM_LOCALVERSION="-${{ env.ANDROID_VER }}-OP-⚡UltraBolt⚡"
+        CUSTOM_LOCALVERSION="-${{ env.ANDROID_VER }}-OP-UltraBolt"
         echo "CUSTOM_LOCALVERSION=$CUSTOM_LOCALVERSION" >> "$GITHUB_ENV"
         echo "Kernel branding: $CUSTOM_LOCALVERSION"    
 
@@ -1099,14 +1099,18 @@ runs:
         
         export PYTHONWARNINGS="${PYTHONWARNINGS}"
         
-        TODAY_MIDNIGHT=$(date -u -d "$(date -u '+%Y-%m-%d') 00:00:00" +%s)
-        export SOURCE_DATE_EPOCH=$TODAY_MIDNIGHT
-        export KBUILD_BUILD_TIMESTAMP="$(date -u -d @${TODAY_MIDNIGHT} '+%Y-%m-%d %H:%M:%S UTC')"
+        echo "Getting last commit timestamp from kernel source..."
+        COMMIT_TIMESTAMP=$(git log -1 --format=%ct 2>/dev/null || echo "$(date +%s)")
+        COMMIT_DATE=$(git log -1 --format=%cd --date=format:'%Y-%m-%d %H:%M:%S' 2>/dev/null || date -u '+%Y-%m-%d %H:%M:%S')
+        COMMIT_HASH=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+        
+        export SOURCE_DATE_EPOCH=$COMMIT_TIMESTAMP
+        export KBUILD_BUILD_TIMESTAMP="$COMMIT_DATE UTC"
         export KBUILD_BUILD_USER="builder"
         export KBUILD_BUILD_HOST="github-actions"
         export KBUILD_BUILD_VERSION=1
         
-        echo "📅 Build timestamp: $KBUILD_BUILD_TIMESTAMP"
+        echo "📅 Build timestamp: $KBUILD_BUILD_TIMESTAMP (from commit $COMMIT_HASH)"
         echo "🔢 SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH"
         
         export PATH="/usr/lib/ccache:${CLANG_BIN_PATH}:${PATH}"
