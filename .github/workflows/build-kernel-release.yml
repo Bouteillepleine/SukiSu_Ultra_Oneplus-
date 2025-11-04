@@ -1,4 +1,4 @@
-name: Build OnePlus Kernels_SukiSu Ultra
+name: Build OnePlus Kernels - SukiSU Ultra
 
 permissions:
   contents: write
@@ -59,20 +59,20 @@ on:
         type: boolean
         default: false
       sched:
-        description: 'Fengchi scheduler'
+        description: 'Fengchi scheduler (6.6 only)'
         type: boolean
         default: false
       enable_zram:
-        description: 'ZRAM'
+        description: 'ZRAM with advanced compressors'
         type: boolean
         default: false
       optimize_level:
-        description: 'Optimization'
+        description: 'Optimization level'
         type: choice
         options: [O2, O3]
         default: O2
       clean_build:
-        description: 'Clean build/No CCache'
+        description: 'Clean build (disable ccache)'
         type: boolean
         default: false
 
@@ -140,14 +140,19 @@ jobs:
           
           **Target:** \`${{ inputs.op_model }}\`  
           **Devices:** ${{ steps.matrix.outputs.count }}  
-          **Configuration:**
-          - Hook: \`${{ inputs.hook }}\`
-          - Optimization: \`${{ inputs.optimize_level }}\`
-          - ZRAM: ${{ inputs.enable_zram }}
-          - BBG LSM: ${{ inputs.lsm }}
-          - Fengchi: ${{ inputs.sched }}
-          - Clean Build: ${{ inputs.clean_build }}
-          - Create Release: ${{ inputs.make_release }}
+          
+          ### Configuration
+          | Setting | Value |
+          |---------|-------|
+          | **Hook Type** | \`${{ inputs.hook }}\` |
+          | **Optimization** | \`${{ inputs.optimize_level }}\` |
+          | **ZRAM** | ${{ inputs.enable_zram && '✅ Enabled' || '❌ Disabled' }} |
+          | **BBG LSM** | ${{ inputs.lsm && '✅ Enabled' || '❌ Disabled' }} |
+          | **Fengchi** | ${{ inputs.sched && '✅ Enabled' || '❌ Disabled' }} |
+          | **ccache** | ${{ inputs.clean_build && '❌ Disabled (clean)' || '✅ Enabled' }} |
+          | **Release** | ${{ inputs.make_release && '✅ Yes' || '❌ No' }} |
+          
+          ---
           EOF
 
   build:
@@ -155,6 +160,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      max-parallel: 3  # ⭐ NEW: Limit concurrent builds to manage resources
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     steps:
       - name: 📥 Checkout repository
@@ -177,7 +183,7 @@ jobs:
       - name: 📊 Build statistics
         if: always()
         run: |
-          echo "::group::Build Statistics"
+          echo "::group::Build Statistics for ${{ matrix.model }}"
           
           echo "Device: ${{ matrix.model }}"
           echo "Status: ${{ job.status }}"
@@ -190,17 +196,34 @@ jobs:
             echo "  - Kernel: ${{ steps.build.outputs.kernel_version }}"
             echo "  - SukiSU: v${{ steps.build.outputs.sukisu_version }}"
             echo "  - SUSFS: ${{ steps.build.outputs.susfs_version }}"
-            echo "  - Build time: ${{ steps.build.outputs.build_time }}s"
+            
+            # ⭐ NEW: Better time formatting
+            build_time="${{ steps.build.outputs.build_time }}"
+            if [ -n "$build_time" ]; then
+              build_min=$((build_time / 60))
+              build_sec=$((build_time % 60))
+              echo "  - Build time: ${build_min}m ${build_sec}s"
+            fi
+            
             echo "  - ZIP: ${{ steps.build.outputs.zip_name }}"
-            echo "  - Size: $(numfmt --to=iec-i --suffix=B ${{ steps.build.outputs.zip_size }} 2>/dev/null || echo '${{ steps.build.outputs.zip_size }} bytes')"
             
+            # ⭐ NEW: Better size formatting
+            zip_size="${{ steps.build.outputs.zip_size }}"
+            if [ -n "$zip_size" ]; then
+              size_mb=$(echo "scale=2; $zip_size / 1024 / 1024" | bc)
+              echo "  - Size: ${size_mb} MB"
+            fi
+            
+            # ⭐ NEW: Show ccache stats only if enabled
             if [ "${{ inputs.clean_build }}" != "true" ]; then
-              echo "  - ccache hit rate: ${{ steps.build.outputs.ccache_hit_rate }}"
+              hit_rate="${{ steps.build.outputs.ccache_hit_rate }}"
+              direct_rate="${{ steps.build.outputs.ccache_direct_rate }}"
+              [ -n "$hit_rate" ] && echo "  - ccache hit rate: ${hit_rate}%"
+              [ -n "$direct_rate" ] && echo "  - ccache direct rate: ${direct_rate}%"
             fi
             
-            if [ -n "${{ steps.build.outputs.warnings_count }}" ]; then
-              echo "  - Warnings: ${{ steps.build.outputs.warnings_count }}"
-            fi
+            warnings="${{ steps.build.outputs.warnings_count }}"
+            [ -n "$warnings" ] && echo "  - Warnings: $warnings"
           else
             echo "❌ Build failed"
           fi
@@ -214,39 +237,56 @@ jobs:
           name: ${{ matrix.model }}-kernel
           path: ${{ matrix.model }}/artifacts/${{ steps.build.outputs.zip_name }}
           retention-days: 30
+          compression-level: 9  # ⭐ NEW: Maximum compression for artifacts
 
       - name: 📝 Job summary
         if: always()
         run: |
+          status_icon="${{ steps.build.outcome == 'success' && '✅' || '❌' }}"
+          status_text="${{ steps.build.outcome == 'success' && 'Success' || 'Failed' }}"
+          
           cat >> $GITHUB_STEP_SUMMARY << EOF
           
-          ### ${{ matrix.model }} - ${{ job.status == 'success' && '✅ Success' || '❌ Failed' }}
+          ### ${{ matrix.model }} - $status_icon $status_text
           
           EOF
           
           if [ "${{ steps.build.outcome }}" = "success" ]; then
+            # ⭐ NEW: Better time and size formatting
+            build_time="${{ steps.build.outputs.build_time }}"
+            build_min=$((build_time / 60))
+            build_sec=$((build_time % 60))
+            
+            zip_size="${{ steps.build.outputs.zip_size }}"
+            size_mb=$(echo "scale=2; $zip_size / 1024 / 1024" | bc)
+            
             cat >> $GITHUB_STEP_SUMMARY << EOF
           | Metric | Value |
           |--------|-------|
           | **Kernel** | ${{ steps.build.outputs.kernel_version }} |
           | **SukiSU** | v${{ steps.build.outputs.sukisu_version }} |
           | **SUSFS** | ${{ steps.build.outputs.susfs_version }} |
-          | **Build Time** | ${{ steps.build.outputs.build_time }}s |
-          | **ZIP Size** | $(numfmt --to=iec-i --suffix=B ${{ steps.build.outputs.zip_size }} 2>/dev/null || echo '${{ steps.build.outputs.zip_size }} bytes') |
+          | **Build Time** | ${build_min}m ${build_sec}s |
+          | **ZIP Size** | ${size_mb} MB |
           EOF
             
+            # ⭐ NEW: Conditional ccache stats
             if [ "${{ inputs.clean_build }}" != "true" ]; then
-              echo "| **ccache Hit Rate** | ${{ steps.build.outputs.ccache_hit_rate }} |" >> $GITHUB_STEP_SUMMARY
+              hit_rate="${{ steps.build.outputs.ccache_hit_rate }}"
+              direct_rate="${{ steps.build.outputs.ccache_direct_rate }}"
+              
+              [ -n "$hit_rate" ] && echo "| **ccache Hit Rate** | ${hit_rate}% |" >> $GITHUB_STEP_SUMMARY
+              [ -n "$direct_rate" ] && echo "| **ccache Direct Rate** | ${direct_rate}% |" >> $GITHUB_STEP_SUMMARY
             fi
             
-            if [ -n "${{ steps.build.outputs.warnings_count }}" ]; then
-              echo "| **Warnings** | ${{ steps.build.outputs.warnings_count }} |" >> $GITHUB_STEP_SUMMARY
-            fi
+            warnings="${{ steps.build.outputs.warnings_count }}"
+            [ -n "$warnings" ] && echo "| **Warnings** | $warnings |" >> $GITHUB_STEP_SUMMARY
             
             cat >> $GITHUB_STEP_SUMMARY << EOF
           
           **Artifact:** \`${{ steps.build.outputs.zip_name }}\`  
-          **SHA256:** \`${{ steps.build.outputs.zip_sha256 }}\`
+          **Image SHA256:** \`${{ steps.build.outputs.image_sha256 }}\`  
+          **ZIP SHA256:** \`${{ steps.build.outputs.zip_sha256 }}\`
           EOF
           fi
 
@@ -284,10 +324,10 @@ jobs:
           
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "$tag" -m "Release $tag"
+          git tag -a "$tag" -m "Release $tag - $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           git push origin "$tag"
           
-          echo "✅ Tag created and pushed"
+          echo "✅ Tag created and pushed: $tag"
           echo "::endgroup::"
 
       - name: 📥 Download all artifacts
@@ -298,20 +338,22 @@ jobs:
       - name: 📦 Prepare release assets
         id: prepare
         run: |
-          echo "::group::Prepare release"
+          echo "::group::Prepare release assets"
           
           mkdir release
           find artifacts -name "*.zip" -exec cp {} release/ \;
           
           count=$(ls -1 release/*.zip 2>/dev/null | wc -l)
           total_size=$(du -sb release | cut -f1)
+          total_mb=$(echo "scale=2; $total_size / 1024 / 1024" | bc)
           
           echo "📦 Prepared $count kernel(s)"
-          echo "📊 Total size: $(numfmt --to=iec-i --suffix=B $total_size)"
+          echo "📊 Total size: ${total_mb} MB"
           
           echo "count=$count" >> $GITHUB_OUTPUT
           echo "total_size=$total_size" >> $GITHUB_OUTPUT
           
+          # ⭐ NEW: Enhanced release notes with build configuration
           cat > notes.md << 'EOF'
           # 🚀 SukiSU Ultra with SUSFS v1.5.12
           
@@ -322,41 +364,59 @@ jobs:
             name=$(basename "$zip" .zip)
             size=$(stat -c%s "$zip")
             size_mb=$(echo "scale=2; $size / 1024 / 1024" | bc)
-            echo "- \`$name\` (${size_mb} MB)" >> notes.md
+            sha256=$(sha256sum "$zip" | cut -d' ' -f1)
+            echo "- **\`$name\`** (${size_mb} MB)" >> notes.md
+            echo "  - SHA256: \`${sha256}\`" >> notes.md
           done
           
-          cat >> notes.md << 'EOF'
+          cat >> notes.md << EOF
+          
+          ## ⚙️ Build Configuration
+          - **Hook Type:** \`${{ inputs.hook }}\`
+          - **Optimization:** \`${{ inputs.optimize_level }}\`
+          - **ZRAM:** ${{ inputs.enable_zram && '✅ Enabled' || '❌ Disabled' }}
+          - **BBG LSM:** ${{ inputs.lsm && '✅ Enabled' || '❌ Disabled' }}
+          - **Fengchi:** ${{ inputs.sched && '✅ Enabled (6.6 only)' || '❌ Disabled' }}
+          - **ccache:** ${{ inputs.clean_build && '❌ Disabled (clean build)' || '✅ Enabled' }}
           
           ## ✨ Features
           - ⚡ **SukiSU Ultra Manager** - Advanced root management
           - 🛡️ **SUSFS v1.5.12** - Enhanced security and hiding
           - 🌐 **WireGuard** - Built-in VPN support
-          - 💾 **ZRAM** - Memory compression (optional)
-          - 🔧 **BBG LSM** - Baseband Guard security (optional)
-          - 🚀 **Optimized Build** - O2/O3 compiler optimizations
+          - 💾 **ZRAM** - Memory compression with advanced compressors
+          - 🔧 **BBG LSM** - Baseband Guard security module
+          - 🚀 **Optimized Build** - Compiler optimizations with ccache
           
           ## 📥 Installation
           1. Download the ZIP for your device
           2. Flash with SukiSU Manager or custom recovery
           3. Reboot and enjoy!
           
+          ## ⚠️ Important Notes
+          - Backup your data before flashing
+          - Ensure you have a working recovery
+          - Check device compatibility before installation
+          
           ## 🔗 Links
           - [SUSFS Module](https://github.com/sidex15/ksu_module_susfs)
           - [SukiSU Manager](https://github.com/SukiSU-Ultra/SukiSU-Ultra)
           - [Report Issues](https://github.com/${{ github.repository }}/issues)
+          - [Discussions](https://github.com/${{ github.repository }}/discussions)
           
           ## 📊 Build Info
           - **Built on:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
           - **Workflow:** ${{ github.workflow }}
           - **Run:** [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          - **Commit:** [\`${{ github.sha }}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
           EOF
           
+          echo "✅ Release notes prepared"
           echo "::endgroup::"
 
       - name: 🚀 Create GitHub release
         id: release
         run: |
-          echo "::group::Create release"
+          echo "::group::Create GitHub release"
           
           gh release create "$TAG" \
             --title "🎯 OnePlus Kernels - SukiSU Ultra $TAG" \
@@ -364,39 +424,65 @@ jobs:
             --prerelease \
             release/*.zip
           
-          echo "✅ Release created: $TAG"
-          echo "🔗 URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG"
+          release_url="${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG"
+          
+          echo "✅ Release created successfully"
+          echo "🏷️ Tag: $TAG"
+          echo "🔗 URL: $release_url"
+          
+          echo "url=$release_url" >> $GITHUB_OUTPUT
           
           echo "::endgroup::"
 
       - name: 📝 Release summary
         if: success()
         run: |
+          total_mb=$(echo "scale=2; ${{ steps.prepare.outputs.total_size }} / 1024 / 1024" | bc)
+          
           cat >> $GITHUB_STEP_SUMMARY << EOF
           
           ---
           
           ## 🎉 Release Created Successfully
           
-          **Tag:** [\`${{ steps.tag.outputs.tag }}\`](${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ steps.tag.outputs.tag }})  
+          **Tag:** [\`${{ steps.tag.outputs.tag }}\`](${{ steps.release.outputs.url }})  
           **Kernels:** ${{ steps.prepare.outputs.count }}  
-          **Total Size:** $(numfmt --to=iec-i --suffix=B ${{ steps.prepare.outputs.total_size }})
+          **Total Size:** ${total_mb} MB
           
-          ### 📦 Assets
+          ### 📦 Released Assets
+          | Kernel | Size | SHA256 |
+          |--------|------|--------|
           EOF
           
           for zip in release/*.zip; do
             name=$(basename "$zip")
             size=$(stat -c%s "$zip")
             size_mb=$(echo "scale=2; $size / 1024 / 1024" | bc)
-            echo "- \`$name\` (${size_mb} MB)" >> $GITHUB_STEP_SUMMARY
+            sha256=$(sha256sum "$zip" | cut -d' ' -f1 | cut -c1-16)
+            echo "| \`$name\` | ${size_mb} MB | \`${sha256}...\` |" >> $GITHUB_STEP_SUMMARY
           done
+          
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          
+          ### 🔗 Quick Links
+          - [📥 Download Release](${{ steps.release.outputs.url }})
+          - [📊 Build Logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          - [💬 Discussions](${{ github.server_url }}/${{ github.repository }}/discussions)
+          EOF
 
       - name: 🧹 Cleanup on failure
         if: failure()
         run: |
           echo "::group::Cleanup failed release"
-          git push origin --delete "$TAG" 2>/dev/null || true
-          git tag -d "$TAG" 2>/dev/null || true
+          
+          # Delete remote tag
+          git push origin --delete "$TAG" 2>/dev/null || echo "⚠️ Remote tag not found"
+          
+          # Delete local tag
+          git tag -d "$TAG" 2>/dev/null || echo "⚠️ Local tag not found"
+          
+          # Try to delete release if it was created
+          gh release delete "$TAG" --yes 2>/dev/null || echo "⚠️ Release not found"
+          
           echo "✅ Cleanup completed"
           echo "::endgroup::"
