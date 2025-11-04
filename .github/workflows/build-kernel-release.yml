@@ -160,7 +160,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      max-parallel: 3  # ⭐ NEW: Limit concurrent builds to manage resources
+      max-parallel: 30
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     steps:
       - name: 📥 Checkout repository
