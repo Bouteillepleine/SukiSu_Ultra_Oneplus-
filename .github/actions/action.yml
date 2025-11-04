@@ -1104,56 +1104,42 @@ runs:
         CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
         CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
         CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-        # TMPFS
         CONFIG_TMPFS_XATTR=y
         CONFIG_TMPFS_POSIX_ACL=y
-        # Network Scheduling
         CONFIG_NET_SCHED=y
         CONFIG_NET_SCH_INGRESS=y
-        CONFIG_NET_FLOW_LIMIT=y        
-        # TCP Congestion Control - BBR
+        CONFIG_NET_FLOW_LIMIT=y
         CONFIG_TCP_CONG_ADVANCED=y
         CONFIG_TCP_CONG_BBR=y
-        CONFIG_TCP_CONG_CUBIC=y        
-        # Queue Disciplines
+        CONFIG_TCP_CONG_CUBIC=y
         CONFIG_NET_SCH_FQ=y
-        CONFIG_NET_SCH_FQ_CODEL=y        
-        # TCP FastOpen
+        CONFIG_NET_SCH_FQ_CODEL=y
         CONFIG_TCP_FASTOPEN=y
-        CONFIG_TCP_FASTOPEN_DEFAULT=3        
-        # ECN Support
+        CONFIG_TCP_FASTOPEN_DEFAULT=3
         CONFIG_IP_ECN=y
         CONFIG_TCP_ECN=y
         CONFIG_IPV6_ECN=y
-        CONFIG_IP_NF_TARGET_ECN=y        
-        # TCP Optimizations
+        CONFIG_IP_NF_TARGET_ECN=y
         CONFIG_TCP_RACK=y
-        CONFIG_TCP_TLP=y        
-        # Network Performance
+        CONFIG_TCP_TLP=y
         CONFIG_RPS=y
         CONFIG_RFS_ACCEL=y
         CONFIG_XPS=y
         CONFIG_GRO_CELLS=y
-        CONFIG_XFRM_OFFLOAD=y        
-        # TTL/HL Manipulation
+        CONFIG_XFRM_OFFLOAD=y
         CONFIG_IP_NF_TARGET_TTL=y
         CONFIG_IP6_NF_TARGET_HL=y
-        CONFIG_IP6_NF_MATCH_HL=y    
-        # Advanced Routing
+        CONFIG_IP6_NF_MATCH_HL=y
         CONFIG_IP_ADVANCED_ROUTER=y
         CONFIG_IP_MULTIPLE_TABLES=y
         CONFIG_NETFILTER_XTABLES=y
-        # Netfilter Extensions
         CONFIG_NETFILTER_XT_TARGET_TCPMSS=y
-        CONFIG_NETFILTER_XT_MATCH_TTL=y        
-        # IP Set Framework
+        CONFIG_NETFILTER_XT_MATCH_TTL=y
         CONFIG_IP_SET=y
-        CONFIG_IP_SET_MAX=65534    
-        # Bitmap Types
+        CONFIG_IP_SET_MAX=65534
         CONFIG_IP_SET_BITMAP_IP=y
         CONFIG_IP_SET_BITMAP_IPMAC=y
-        CONFIG_IP_SET_BITMAP_PORT=y        
-        # Hash Types
+        CONFIG_IP_SET_BITMAP_PORT=y
         CONFIG_IP_SET_HASH_IP=y
         CONFIG_IP_SET_HASH_IPMARK=y
         CONFIG_IP_SET_HASH_IPPORT=y
@@ -1165,43 +1151,31 @@ runs:
         CONFIG_IP_SET_HASH_NET=y
         CONFIG_IP_SET_HASH_NETNET=y
         CONFIG_IP_SET_HASH_NETPORT=y
-        CONFIG_IP_SET_HASH_NETIFACE=y    
-        # List Type
+        CONFIG_IP_SET_HASH_NETIFACE=y
         CONFIG_IP_SET_LIST_SET=y
-        # Compiler
-        CONFIG_LD_DEAD_CODE_DATA_ELIMINATION=y    
-        # Power Efficiency
+        CONFIG_LD_DEAD_CODE_DATA_ELIMINATION=y
         CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y
-        # Disable Kernel Debugging
         CONFIG_DEBUG_KERNEL=n
         CONFIG_DEBUG_INFO=n
-        CONFIG_DEBUG_INFO_DWARF4=n       
-        # Disable Lock Debugging
+        CONFIG_DEBUG_INFO_DWARF4=n
         CONFIG_LOCK_DEBUGGING=n
         CONFIG_DEBUG_MUTEXES=n
         CONFIG_DEBUG_SPINLOCK=n
         CONFIG_DEBUG_ATOMIC_SLEEP=n
-        EOF
-        
-        OPTIMIZE="${{ inputs.optimize_level }}"
-        if [ "$OPTIMIZE" = "O3" ]; then
-          cat >> "$CONFIG_FILE" << 'EOF'
-        CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=n
-        CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3=y
-        EOF
-        else
-          cat >> "$CONFIG_FILE" << 'EOF'
-        CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y
-        CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3=n
-        EOF
-        fi
-        
-        cat >> "$CONFIG_FILE" << 'EOF'
         CONFIG_LTO_CLANG_THIN=y
         CONFIG_LTO_CLANG=y
         CONFIG_OPTIMIZE_INLINING=y
         EOF
-
+        
+        OPTIMIZE="${{ inputs.optimize_level }}"
+        if [ "$OPTIMIZE" = "O3" ]; then
+          echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=n" >> "$CONFIG_FILE"
+          echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3=y" >> "$CONFIG_FILE"
+        else
+          echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> "$CONFIG_FILE"
+          echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3=n" >> "$CONFIG_FILE"
+        fi
+        
         if [ "${{ inputs.enable_zram }}" = "true" ]; then
           cat >> "$CONFIG_FILE" << 'EOF'
         CONFIG_CRYPTO_LZ4HC=y
@@ -1224,7 +1198,6 @@ runs:
         
         sed -i 's/check_defconfig//' ./common/build.config.gki
 
-        # KUNIT DISABLE CODE HERE
         echo "Generating initial .config..."
         cd ./common
         OUT=out
@@ -1232,7 +1205,6 @@ runs:
         
         make O="$OUT" gki_defconfig
         
-        # Disable KUnit and related test configs
         echo "Disabling KUnit test configurations..."
         disable_list=(
           CONFIG_REGMAP_KUNIT
