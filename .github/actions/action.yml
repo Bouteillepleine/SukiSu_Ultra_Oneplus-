@@ -799,8 +799,8 @@ runs:
             ;;
           manual)
             echo "Applying manual hooks patch..."
-            cp "$GITHUB_WORKSPACE/SukiSU_patch/hooks/scope_min_manual_hooks_v1.5.patch" ./
-            if patch -p1 -F 3 < scope_min_manual_hooks_v1.5.patch; then
+            cp "$GITHUB_WORKSPACE/SukiSU_patch/hooks/scope_min_manual_hooks_v1.6.patch" ./
+            if patch -p1 -F 3 < scope_min_manual_hooks_v1.6.patch; then
               echo "✅ Manual hooks patch applied"
             else
               echo "::warning::Manual hooks patch applied with warnings"
