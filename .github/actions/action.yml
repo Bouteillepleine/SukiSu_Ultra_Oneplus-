@@ -391,11 +391,12 @@ runs:
       uses: actions/cache@v4
       if: ${{ inputs.clean != 'true' }}
       with:
-        path: ${{ env.CCACHE_DIR }}        
-        key: ccache-sukisu-v4-kernel-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-${{ env.CLANG_VERSION_SHORT }}
+        path: ${{ env.CCACHE_DIR }}
+        key: ccache-suki-v4-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.ANDROID_VER }}-${{ env.KERNEL_VER }}-${{ env.CLANG_VERSION_SHORT }}
         restore-keys: |
-          ccache-sukisu-v4-kernel-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-
-          ccache-sukisu-v4-kernel-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-
+          ccache-suki-v4-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.ANDROID_VER }}-${{ env.KERNEL_VER }}-
+          ccache-suki-v4-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-
+          ccache-suki-v4-${{ env.ANDROID_VER }}-${{ env.KERNEL_VER }}-
    
     - name: ⚡ Configure ccache
       if: ${{ inputs.clean != 'true' }}
