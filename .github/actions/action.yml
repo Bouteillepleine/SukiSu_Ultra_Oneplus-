@@ -1228,3 +1228,548 @@ runs:
         
         if [ "${{ inputs.clean }}" != "true" ]; then
           echo "ccache: ENABLED"
+                    echo "  Dir: $CCACHE_DIR"
+          echo "  Base: $CCACHE_BASEDIR"
+          echo "  Max size: $CCACHE_MAXSIZE"
+          echo "  Compression: zstd level 3"
+          echo "  Features: readonly_direct, file_clone, inode_cache, depend"
+        else
+          echo "ccache: DISABLED"
+        fi
+        echo "============================================"
+        
+        if [ "${{ inputs.clean }}" != "true" ]; then
+          if [ ! -d "$CCACHE_DIR" ] || [ -z "$(find "$CCACHE_DIR" -type f 2>/dev/null | head -n1)" ]; then
+            echo "🔥 Priming cache with header preprocessing..."
+            make -C "$COMMON" O="$OUT" headers_install prepare 2>&1 | head -n 20 || true
+            echo ""
+          fi
+        fi
+        
+        BUILD_START=$(date +%s)
+        set -o pipefail
+        
+        make -j"$(nproc --all)" O="$OUT" KCFLAGS="$KCFLAGS" KCPPFLAGS="$KCPPFLAGS" 2>&1 | tee build.log
+        
+        BUILD_END=$(date +%s)
+        BUILD_TIME=$((BUILD_END - BUILD_START))
+        
+        echo "BUILD_START=$BUILD_START" >> "$GITHUB_ENV"
+        echo "BUILD_END=$BUILD_END" >> "$GITHUB_ENV"
+        echo "BUILD_TIME=$BUILD_TIME" >> "$GITHUB_ENV"
+        
+        IMG="$OUT/arch/arm64/boot/Image"
+        if [ ! -f "$IMG" ]; then
+          echo "::error::Kernel Image missing"
+          echo "::group::Last 100 lines of build log"
+          tail -n 100 build.log || echo "Build log not available"
+          echo "::endgroup::"
+          exit 1
+        fi
+        
+        IMG_SIZE=$(stat -c%s "$IMG")
+        
+        echo "============================================"
+        echo "✅ Build Completed Successfully"
+        echo "============================================"
+        echo "Duration: $((BUILD_TIME / 60))m $((BUILD_TIME % 60))s"
+        echo "Image: $(numfmt --to=iec-i --suffix=B "$IMG_SIZE")"
+        
+        if [ "${{ inputs.clean }}" != "true" ]; then
+          echo ""
+          echo "📊 ccache Post-Build Statistics"
+          echo "============================================"
+          ccache -s
+        fi
+        echo "============================================"
+        echo "::endgroup::"
+
+    - name: 📊 ccache Post-Build Statistics
+      id: ccache_stats
+      if: ${{ always() && inputs.clean != 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::ccache final statistics"
+        
+        export CCACHE_DIR="${{ env.CCACHE_DIR }}"
+        
+        echo "ccache Statistics"
+        ccache -s
+        
+        STATS="$(ccache -s)"
+        
+        CACHEABLE=$(echo "$STATS" | awk '/Cacheable calls:/ {
+          match($0, /[0-9]+/); 
+          print substr($0, RSTART, RLENGTH)
+        }' | head -n1)
+        
+        HITS=$(echo "$STATS" | awk '/^[[:space:]]*Hits:/ {
+          match($0, /[0-9]+/); 
+          print substr($0, RSTART, RLENGTH)
+        }' | head -n1)
+        
+        DIRECT=$(echo "$STATS" | awk '/Direct:/ {
+          match($0, /[0-9]+/); 
+          print substr($0, RSTART, RLENGTH)
+        }' | head -n1)
+        
+        if [ "${CACHEABLE:-0}" -gt 0 ]; then
+          HIT_RATE=$(awk -v h="${HITS:-0}" -v c="$CACHEABLE" 'BEGIN{printf "%.1f", (h/c)*100}')
+          DIRECT_RATE=$(awk -v d="${DIRECT:-0}" -v c="$CACHEABLE" 'BEGIN{printf "%.1f", (d/c)*100}')
+        else
+          HIT_RATE="0.0"
+          DIRECT_RATE="0.0"
+        fi
+        
+        echo "hit_rate=${HIT_RATE}%" >> "$GITHUB_OUTPUT"
+        echo "direct_rate=${DIRECT_RATE}%" >> "$GITHUB_OUTPUT"
+        
+        echo "::endgroup::"
+        
+        echo "## 📊 ccache Statistics" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        ccache -s >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+    - name: Check Disk Space (Post-Build)
+      if: always()
+      shell: bash
+      run: |
+        echo "::group::Disk space report"
+        df -h
+        echo ""
+        echo "Largest directories in workspace:"
+        du -h --max-depth=2 "$GITHUB_WORKSPACE" 2>/dev/null | sort -rh | head -n 20 || true
+        echo "::endgroup::"
+
+    - name: On failure - Summarize last error
+      if: ${{ failure() }}
+      shell: bash
+      run: |
+        set +e
+        echo "::group::Build Failure Analysis"
+        COMMON="$GITHUB_WORKSPACE/$CONFIG/kernel_platform/common"
+        
+        echo "## 🔴 Build Failed - Last 120 Lines" >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        
+        if [ -f "$COMMON/build.log" ]; then
+          tail -n 120 "$COMMON/build.log" >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "build.log not available" >> "$GITHUB_STEP_SUMMARY"
+        fi
+        
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        echo "::endgroup::"
+    
+    - name: 💾 Save ccache
+      if: success()
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ env.CCACHE_DIR }}
+        # ✅ Must match the restore key format
+        key: ccache-suki-v3-${{ env.ANDROID_VER }}-${{ env.KERNEL_VER }}-${{ env.CLANG_VERSION_SHORT }}-${{ github.run_id }}
+   
+    - name: Save Build Metadata
+      id: save_metadata
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Save Build Metadata"
+        
+        CONFIG_DIR="$GITHUB_WORKSPACE/$CONFIG"
+        ARTIFACTS_DIR="$CONFIG_DIR/artifacts"
+        mkdir -p "$ARTIFACTS_DIR"
+        
+        KERNEL_VERSION="${KERNEL_FULL_VER:-}"
+        SUKISU_VERSION="${SUKISUVER:-}"
+        SUSFS_VERSION="${SUSVER:-}"
+        
+        if [ -z "$KERNEL_VERSION" ] && [ -f "$ARTIFACTS_DIR/kernel_version.txt" ]; then
+          KERNEL_VERSION=$(cat "$ARTIFACTS_DIR/kernel_version.txt")
+        fi
+        
+        if [ -z "$SUKISU_VERSION" ]; then
+          KSU_DIR="$CONFIG_DIR/kernel_platform/KernelSU"
+          if [ -d "$KSU_DIR" ]; then
+            cd "$KSU_DIR"
+            for b in main master susfs-main; do
+              if git show-ref --verify --quiet "refs/heads/$b" 2>/dev/null || \
+                 git show-ref --verify --quiet "refs/remotes/origin/$b" 2>/dev/null; then
+                commit_count=$(git rev-list --count "$b" 2>/dev/null || echo 13000)
+                SUKISU_VERSION=$((commit_count + 10700))
+                break
+              fi
+            done
+          fi
+        fi
+        
+        if [ -z "$SUSFS_VERSION" ]; then
+          SUSFS_HEADER="$CONFIG_DIR/kernel_platform/common/include/linux/susfs.h"
+          if [ -f "$SUSFS_HEADER" ]; then
+            SUSFS_VERSION=$(grep '#define SUSFS_VERSION' "$SUSFS_HEADER" | awk -F'"' '{print $2}')
+          fi
+        fi
+        
+        KERNEL_VERSION="${KERNEL_VERSION:-unknown}"
+        SUKISU_VERSION="${SUKISU_VERSION:-unknown}"
+        SUSFS_VERSION="${SUSFS_VERSION:-unknown}"
+        
+        echo "kernel_version=${KERNEL_VERSION}" >> "$GITHUB_OUTPUT"
+        echo "sukisu_version=${SUKISU_VERSION}" >> "$GITHUB_OUTPUT"
+        echo "susfs_version=${SUSFS_VERSION}" >> "$GITHUB_OUTPUT"
+        
+        echo "KERNEL_VERSION=${KERNEL_VERSION}" >> "$GITHUB_ENV"
+        echo "SUKISU_VERSION=${SUKISU_VERSION}" >> "$GITHUB_ENV"
+        echo "SUSFS_VERSION=${SUSFS_VERSION}" >> "$GITHUB_ENV"
+        
+        echo "✅ Metadata saved:"
+        echo "   - Kernel: ${KERNEL_VERSION}"
+        echo "   - SukiSU: ${SUKISU_VERSION}"
+        echo "   - SUSFS: ${SUSFS_VERSION}"
+        
+        echo "::endgroup::"
+
+    - name: Collect Build Stats / Validate Image
+      id: collect_stats
+      shell: bash
+      run: |
+        set -euo pipefail
+        
+        KERNEL_PATH="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
+        COMMON="$KERNEL_PATH/common"
+        OUT="$COMMON/out"
+        IMG="$OUT/arch/arm64/boot/Image"
+        
+        if [ -f "$COMMON/build.log" ]; then
+          WARNINGS_COUNT="$(grep -ciE '\bwarning:' "$COMMON/build.log" || true)"
+          [ -n "$WARNINGS_COUNT" ] || WARNINGS_COUNT="0"
+        else
+          WARNINGS_COUNT="0"
+        fi
+        
+        if [ ! -f "$IMG" ]; then
+          echo "::error::Kernel Image not found at: $IMG"
+          exit 1
+        fi
+        
+        if ! file "$IMG" | grep -qi 'ARM64'; then
+          echo "::error::Image is not ARM64 format"
+          file "$IMG"
+          exit 1
+        fi
+        
+        IMG_SIZE=$(stat -c %s "$IMG")
+        MIN_SIZE=6102400
+        if [ "$IMG_SIZE" -lt "$MIN_SIZE" ]; then
+          echo "::error::Image size too small: $(numfmt --to=iec-i --suffix=B "$IMG_SIZE")"
+          exit 1
+        fi
+        
+        IMG_SHA256=$(sha256sum "$IMG" | awk '{print $1}')
+        
+        BUILD_TIME="${BUILD_TIME:-0}"
+        
+        printf 'warnings_count=%s\n' "$WARNINGS_COUNT" >> "$GITHUB_OUTPUT"
+        printf 'image_sha256=%s\n' "$IMG_SHA256" >> "$GITHUB_OUTPUT"
+        printf 'build_time=%s\n' "$BUILD_TIME" >> "$GITHUB_OUTPUT"
+        
+        echo "✅ Validation passed:"
+        echo "   - Warnings: $WARNINGS_COUNT"
+        echo "   - Image size: $(numfmt --to=iec-i --suffix=B "$IMG_SIZE")"
+        echo "   - SHA256: $IMG_SHA256"
+        echo "   - Build time: ${BUILD_TIME}s"
+    
+    - name: Download and Package ZRAM Module
+      if: ${{ inputs.enable_zram == 'true' }}
+      id: zram_find
+      shell: bash
+      continue-on-error: true
+      run: |
+        set -e
+        echo "::group::Download and package ZRAM module"
+        echo "Fetching ZRAM module ZIP download link..."
+        retries=3
+        success=0
+        for i in $(seq 1 $retries); do
+          echo "Attempt $i of $retries..."
+          download_url=$(curl -s https://api.github.com/repos/Bouteillepleine/ZRAM-Module/releases/latest | \
+            grep "browser_download_url" | grep "ZRAM-Module-.*\.zip" | cut -d '"' -f 4 | head -n 1)
+    
+          if [ -n "$download_url" ]; then
+            echo "Successfully retrieved download link: $download_url"
+            wget -N "$download_url" && success=1 && break
+          else
+            echo "Failed to get download link, retrying in 3 seconds..."
+            sleep 3
+          fi
+        done
+    
+        if [ "$success" -ne 1 ]; then
+          echo "Failed to retrieve ZRAM module download link after $retries attempts"
+          echo "upload=false" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+          exit 0
+        fi
+    
+        unzip "$(ls -t ZRAM-Module-*.zip | head -1)" -d ZRAM-Module
+        target="./ZRAM-Module/zram/zram.ko"
+        
+        echo "Searching for zram.ko module file..."
+        search_paths=(
+          "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/common/out"
+          "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/out"
+          "$GITHUB_WORKSPACE/$CONFIG/device/qcom"
+        )
+        
+        zram_path=""
+        for path in "${search_paths[@]}"; do
+          zram_path=$(find "$path" -type f -name "zram.ko" 2>/dev/null | head -n 1)
+          [ -n "$zram_path" ] && break
+        done
+        
+        if [ -z "$zram_path" ]; then
+          zram_path=$(find "$GITHUB_WORKSPACE/$CONFIG" -type f -name "zram.ko" 2>/dev/null | head -n 1)
+        fi
+        
+        if [ -n "$zram_path" ] && [ -f "$zram_path" ]; then
+          echo "✅ ZRAM module found at: $zram_path"
+          mkdir -p "$(dirname "$target")"
+          if [ "$(realpath "$zram_path")" != "$(realpath "$target")" ]; then
+            cp "$zram_path" "$target"
+            echo "✅ ZRAM module copied to package"
+          else
+            echo "ℹ️ Source and target are the same, skipping copy"
+          fi
+          echo "upload=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "⚠️ zram.ko file not found in build output (may be built-in)"
+          echo "upload=false" >> "$GITHUB_OUTPUT"
+        fi
+        echo "::endgroup::"
+
+    - name: Download SUSFS Module from CI
+      shell: bash
+      continue-on-error: true
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+      run: |
+        set -euo pipefail
+        echo "::group::Download SUSFS module"
+        
+        echo "Fetching latest successful workflow run for branch v1.5.2+..."
+        
+        LATEST_RUN_ID=$(curl -fsSL --retry 3 --connect-timeout 30 \
+          -H "Authorization: Bearer $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/sidex15/susfs4ksu-module/actions/runs?status=success&per_page=50" | \
+          jq -r '.workflow_runs[] | select(.head_branch == "v1.5.2+") | .id' | head -n 1)
+        
+        if [ -z "$LATEST_RUN_ID" ]; then
+          echo "⚠️ No successful workflow run found for branch v1.5.2+"
+          echo "::warning::SUSFS module will not be included in the kernel ZIP"
+          echo "::endgroup::"
+          exit 0
+        fi
+        
+        echo "Found workflow run ID: $LATEST_RUN_ID"
+        echo "Fetching artifact download URL..."
+        
+        ARTIFACT_URL=$(curl -fsSL --retry 3 --connect-timeout 30 \
+          -H "Authorization: Bearer $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/sidex15/susfs4ksu-module/actions/runs/$LATEST_RUN_ID/artifacts" | \
+          jq -r '.artifacts[0].archive_download_url // empty')
+        
+        if [ -z "$ARTIFACT_URL" ]; then
+          echo "⚠️ No artifact found in workflow run $LATEST_RUN_ID"
+          echo "::warning::SUSFS module will not be included in the kernel ZIP"
+          echo "::endgroup::"
+          exit 0
+        fi
+        
+        echo "Artifact URL: $ARTIFACT_URL"
+        echo "Downloading SUSFS module to AnyKernel3 directory..."
+        
+        if curl -fsSL --retry 3 --connect-timeout 30 \
+             -H "Authorization: Bearer $GITHUB_TOKEN" \
+             -H "Accept: application/vnd.github+json" \
+             -o "$GITHUB_WORKSPACE/AnyKernel3/ksu_module_susfs_1.5.2+_CI.zip" \
+             "$ARTIFACT_URL"; then
+          
+          if [ -f "$GITHUB_WORKSPACE/AnyKernel3/ksu_module_susfs_1.5.2+_CI.zip" ]; then
+            FILE_SIZE=$(stat -c%s "$GITHUB_WORKSPACE/AnyKernel3/ksu_module_susfs_1.5.2+_CI.zip")
+            
+            if [ "$FILE_SIZE" -gt 1024 ]; then
+              echo "✅ SUSFS module downloaded successfully"
+              echo "   File: ksu_module_susfs_1.5.2+_CI.zip"
+              echo "   Size: $(numfmt --to=iec-i --suffix=B "$FILE_SIZE")"
+              ls -lh "$GITHUB_WORKSPACE/AnyKernel3/ksu_module_susfs_1.5.2+_CI.zip"
+            else
+              echo "⚠️ Downloaded file is too small (${FILE_SIZE} bytes)"
+              rm -f "$GITHUB_WORKSPACE/AnyKernel3/ksu_module_susfs_1.5.2+_CI.zip"
+              echo "::warning::SUSFS module download failed - file too small"
+            fi
+          else
+            echo "⚠️ Downloaded file not found"
+            echo "::warning::SUSFS module download failed - file missing"
+          fi
+        else
+          echo "⚠️ Failed to download SUSFS module"
+          echo "::warning::SUSFS module will not be included in the kernel ZIP"
+        fi
+        
+        echo "::endgroup::"
+
+    - name: Create kernel ZIP package
+      id: create_zip
+      shell: bash
+      env:
+        KERNEL_VERSION: ${{ env.KERNEL_FULL_VER }}
+        SUKISU_VERSION: ${{ env.SUKISUVER }}
+      run: |
+        set -euo pipefail
+        echo "::group::Create kernel ZIP package"
+        
+        CONFIG_DIR="$GITHUB_WORKSPACE/$CONFIG"
+        IMAGE_PATH="$CONFIG_DIR/kernel_platform/common/out/arch/arm64/boot/Image"
+        
+        if [ ! -f "$IMAGE_PATH" ]; then
+          echo "::error::Built Image not found at: $IMAGE_PATH"
+          exit 1
+        fi
+        
+        cp "$IMAGE_PATH" "$GITHUB_WORKSPACE/AnyKernel3/Image"
+        cd "$GITHUB_WORKSPACE/AnyKernel3"
+        
+        KERNEL_VER="${KERNEL_VERSION:-${KERNEL_FULL_VER:-unknown}}"
+        SUKISU_VER="${SUKISU_VERSION:-${SUKISUVER:-unknown}}"
+        
+        ZIP_NAME="AnyKernel3_${OP_MODEL}_${KERNEL_VER}_SukiSU_${SUKISU_VER}.zip"
+        
+        ARTIFACTS_DIR="$CONFIG_DIR/artifacts"
+        mkdir -p "$ARTIFACTS_DIR"
+        
+        echo "Creating flashable ZIP: $ZIP_NAME"
+        
+        if ! zip -r9 "$ZIP_NAME" ./* \
+             -x "*.git*" \
+             -x "$ZIP_NAME" \
+             -x "README.md" 2>&1 | tee /tmp/zip.log; then
+          echo "::error::Failed to create ZIP package"
+          exit 1
+        fi
+        
+        mv "$ZIP_NAME" "$ARTIFACTS_DIR/"
+        
+        ZIP_SIZE=$(stat -c%s "$ARTIFACTS_DIR/$ZIP_NAME")
+        ZIP_SHA256=$(sha256sum "$ARTIFACTS_DIR/$ZIP_NAME" | awk '{print $1}')
+        
+        echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+        echo "zip_size=$ZIP_SIZE" >> "$GITHUB_OUTPUT"
+        echo "zip_sha256=$ZIP_SHA256" >> "$GITHUB_OUTPUT"
+        
+        echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+        echo "ZIP_SIZE=$ZIP_SIZE" >> "$GITHUB_ENV"
+        echo "ZIP_SHA256=$ZIP_SHA256" >> "$GITHUB_ENV"
+        
+        echo ""
+        echo "✅ Kernel ZIP created successfully"
+        echo "   Name: $ZIP_NAME"
+        echo "   Size: $(numfmt --to=iec-i --suffix=B "$ZIP_SIZE")"
+        echo "   SHA256: $ZIP_SHA256"
+        echo "::endgroup::"
+
+    - name: Upload ZRAM Module
+      if: ${{ inputs.enable_zram == 'true' && steps.zram_find.outputs.upload == 'true' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: ZRAM-Module_${{ env.KERNEL_VER }}_${{ env.OP_MODEL }}
+        path: ZRAM-Module/*
+        retention-days: 30
+        compression-level: 9
+    
+    - name: Generate Build Summary
+      if: always()
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "## 🎯 Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        echo "### 📦 Build Information" >> $GITHUB_STEP_SUMMARY
+        echo "| Component | Version |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----------|---------|" >> $GITHUB_STEP_SUMMARY
+        echo "| **Device** | ${OP_MODEL} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **SoC** | ${OP_SOC} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Kernel** | ${{ steps.save_metadata.outputs.kernel_version }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **SukiSU** | v${{ steps.save_metadata.outputs.sukisu_version }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **SUSFS** | ${{ steps.save_metadata.outputs.susfs_version }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Hook Type** | ${{ inputs.hook }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Optimization** | ${{ inputs.optimize_level }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **ZRAM** | ${{ inputs.enable_zram }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **BBG LSM** | ${{ inputs.lsm }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Fengchi** | ${{ inputs.sched }} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ -n "${{ steps.create_zip.outputs.zip_name }}" ]; then
+          echo "### 📥 Download" >> $GITHUB_STEP_SUMMARY
+          echo "**Filename:** \`${{ steps.create_zip.outputs.zip_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -n "${ZIP_SIZE:-}" ]; then
+            SIZE_MB=$(echo "scale=2; ${ZIP_SIZE} / 1024 / 1024" | bc)
+            echo "**Size:** ${SIZE_MB} MB" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -n "${ZIP_SHA256:-}" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**SHA256:** \`${ZIP_SHA256}\`" >> $GITHUB_STEP_SUMMARY
+          fi
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📊 Build Statistics" >> $GITHUB_STEP_SUMMARY
+        
+        if [ -n "${{ steps.collect_stats.outputs.build_time }}" ]; then
+          BUILD_TIME="${{ steps.collect_stats.outputs.build_time }}"
+          BUILD_MIN=$((BUILD_TIME / 60))
+          BUILD_SEC=$((BUILD_TIME % 60))
+          echo "- **Build Time:** ${BUILD_MIN}m ${BUILD_SEC}s" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        if [ -n "${{ steps.collect_stats.outputs.warnings_count }}" ]; then
+          echo "- **Warnings:** ${{ steps.collect_stats.outputs.warnings_count }}" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        if [ -n "${CLANG_VERSION:-}" ]; then
+          echo "- **Compiler:** ${CLANG_VERSION}" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        if [ -n "${{ steps.collect_stats.outputs.image_sha256 }}" ]; then
+          echo "- **Image SHA256:** \`${{ steps.collect_stats.outputs.image_sha256 }}\`" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ inputs.enable_zram }}" = "true" ]; then
+          echo "### 🔧 ZRAM Module" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.zram_find.outputs.upload }}" = "true" ]; then
+            echo "- ✅ **Status:** Available" >> $GITHUB_STEP_SUMMARY
+            echo "- 📦 **Artifact:** ZRAM-Module_${KERNEL_VER}_${OP_MODEL}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- ⚠️ **Status:** Not found (may be built-in)" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "---" >> $GITHUB_STEP_SUMMARY
+        echo "*Built with ❤️ using GitHub Actions*" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Build Configuration:**" >> $GITHUB_STEP_SUMMARY
+        echo "- Branch: ${OP_BRANCH}" >> $GITHUB_STEP_SUMMARY
+        echo "- Manifest: ${OP_MANIFEST}" >> $GITHUB_STEP_SUMMARY
+        echo "- KSU Meta: ${{ inputs.ksu_meta }}" >> $GITHUB_STEP_SUMMARY
