@@ -223,35 +223,34 @@ runs:
         set -euo pipefail
         echo "::group::Initialize kernel source"
         
-        # ============================================================================
-        # CONFIGURATION SUMMARY
-        # ============================================================================
+        # ========================================================================
+        # CONFIGURATION
+        # ========================================================================
         echo "📋 Configuration:"
         echo "  Model: $CONFIG"
         echo "  Branch: $OP_BRANCH"
         echo "  Manifest: $OP_MANIFEST"
-        echo "  Repo version: v2.16"
         echo ""
         
-        # ============================================================================
+        # ========================================================================
         # WORKSPACE SETUP
-        # ============================================================================
+        # ========================================================================
         echo "📁 Creating workspace: $CONFIG"
         mkdir -p "$CONFIG"
         cd "$CONFIG"
         
-        # ============================================================================
+        # ========================================================================
         # MANIFEST HANDLING
-        # ============================================================================
+        # ========================================================================
         echo "🔧 Initializing repo..."
         
         if [[ "$OP_MANIFEST" == https://* ]]; then
-          echo "  Mode: Direct URL download"
+          echo "  Mode: Direct URL"
           echo "  URL: $OP_MANIFEST"
           
           mkdir -p .repo/manifests
           
-          # Download manifest with timeout protection
+          # Download with timeout protection
           if ! curl --fail --show-error --location --proto '=https' \
                --connect-timeout 30 --max-time 300 \
                "$OP_MANIFEST" -o .repo/manifests/temp_manifest.xml; then
@@ -259,58 +258,38 @@ runs:
             exit 1
           fi
           
-          # Validate downloaded manifest
-          MANIFEST_SIZE=$(stat -c%s .repo/manifests/temp_manifest.xml)
-          echo "  ✅ Downloaded manifest (${MANIFEST_SIZE} bytes)"
+          MANIFEST_FILE="temp_manifest.xml"
           
-          # XML validation
+          # Validation (non-fatal unless XML invalid)
+          SIZE=$(stat -c%s .repo/manifests/temp_manifest.xml 2>/dev/null || echo 0)
+          echo "  Downloaded: ${SIZE} bytes"
+          
+          [ "$SIZE" -lt 200 ] && \
+            echo "::warning::Manifest is quite small (${SIZE} bytes) - verify URL is correct"
+          
           if command -v xmllint >/dev/null 2>&1; then
             if ! xmllint --noout .repo/manifests/temp_manifest.xml; then
-              echo "::error::Manifest XML invalid: $OP_MANIFEST"
+              echo "::error::Manifest XML is invalid"
               exit 1
             fi
             echo "  ✅ XML validation passed"
-          else
-            echo "::warning::xmllint not found; skipping XML validation"
           fi
           
-          # Size sanity check
-          if [ "$MANIFEST_SIZE" -lt 200 ]; then
-            echo "::warning::Manifest file is quite small (${MANIFEST_SIZE} bytes)"
-            echo "::warning::This might indicate an incomplete download or error page"
-          fi
-          
-          MANIFEST_FILE="temp_manifest.xml"
         else
           echo "  Mode: Repository manifest"
           echo "  File: $OP_MANIFEST"
           MANIFEST_FILE="$OP_MANIFEST"
         fi
         
-        # ============================================================================
-        # REPO TOOL VERIFICATION
-        # ============================================================================
-        command -v "$REPO" >/dev/null 2>&1 || {
-          echo "::error::repo tool not found at: $REPO"
-          echo "::error::PATH: $PATH"
-          echo "::error::Available commands:"
-          compgen -c | grep -i repo || echo "  (none found)"
-          exit 1
-        }
-        
-        echo "  ✅ repo tool: $REPO"
-        
-        # ============================================================================
-        # REPO INITIALIZATION WITH RETRY
-        # ============================================================================
+        # ========================================================================
+        # REPO INIT WITH RETRY
+        # ========================================================================
         echo ""
         echo "🔧 Running repo init..."
         
         INIT_SUCCESS=false
         for attempt in 1 2 3; do
-          if [ $attempt -gt 1 ]; then
-            echo "  Attempt $attempt/3..."
-          fi
+          [ $attempt -gt 1 ] && echo "  Attempt $attempt/3..."
           
           if "$REPO" init \
              -u https://github.com/OnePlusOSS/kernel_manifest.git \
@@ -326,15 +305,34 @@ runs:
           fi
           
           if [ $attempt -lt 3 ]; then
-            echo "  ⚠️  repo init attempt $attempt failed; retrying in 10s..."
+            echo "  ⚠️  Attempt $attempt failed; retrying in 10s..."
             sleep 10
           fi
         done
         
         if [ "$INIT_SUCCESS" = false ]; then
+          echo ""
           echo "::error::repo init failed after 3 attempts"
           echo "::error::Branch: $OP_BRANCH"
           echo "::error::Manifest: $MANIFEST_FILE"
+          
+          # Show helpful debug info
+          if [[ "$OP_MANIFEST" != https://* ]]; then
+            echo ""
+            echo "::group::Available manifests in branch"
+            echo "Check: https://github.com/OnePlusOSS/kernel_manifest/tree/${OP_BRANCH}"
+            
+            # Try to list available manifests
+            if command -v jq >/dev/null 2>&1; then
+              curl -s "https://api.github.com/repos/OnePlusOSS/kernel_manifest/contents?ref=${OP_BRANCH}" 2>/dev/null \
+                | jq -r '.[] | select(.name | endswith(".xml")) | "  - \(.name)"' \
+                || echo "  (unable to list - check URL above)"
+            else
+              echo "  Install jq to auto-list available manifests"
+            fi
+            echo "::endgroup::"
+          fi
+          
           exit 1
         fi
         
@@ -342,124 +340,117 @@ runs:
         echo ""
         "$REPO" --version
         
-        # ============================================================================
+        # ========================================================================
         # SYNC ENVIRONMENT TUNING
-        # ============================================================================
+        # ========================================================================
         echo ""
-        echo "⚙️  Configuring sync environment..."
+        echo "⚙️  Configuring sync..."
         
-        export REPO_SYNC_JOBS="$(nproc --all)"
+        SYNC_JOBS=$(nproc --all)
+        [ "$SYNC_JOBS" -gt 30 ] && SYNC_JOBS=30
+        
         export GIT_HTTP_LOW_SPEED_LIMIT=1000
         export GIT_HTTP_LOW_SPEED_TIME=60
         
-        echo "  Parallel jobs: $REPO_SYNC_JOBS"
-        echo "  HTTP low speed limit: ${GIT_HTTP_LOW_SPEED_LIMIT} bytes/s"
-        echo "  HTTP low speed timeout: ${GIT_HTTP_LOW_SPEED_TIME}s"
+        echo "  Parallel jobs: $SYNC_JOBS"
+        echo "  Stall protection: ${GIT_HTTP_LOW_SPEED_LIMIT} bytes/s for ${GIT_HTTP_LOW_SPEED_TIME}s"
         
-        # ============================================================================
+        # ========================================================================
         # KERNEL SOURCE SYNC WITH RETRY
-        # ============================================================================
+        # ========================================================================
         echo ""
         echo "📥 Syncing kernel source..."
-        echo "  Options: force-sync, optimized-fetch, prune, fail-fast"
-        echo ""
         
         SYNC_START=$(date +%s)
         success=false
         
-        for attempt in 1 2 3; do
-          echo "🔄 Sync attempt $attempt/3..."
+        for i in 1 2 3; do
+          echo "🔄 Sync attempt $i/3 (jobs: $SYNC_JOBS)..."
           
           if "$REPO" sync -c \
-             --force-sync \
              --no-clone-bundle \
              --no-tags \
              --optimized-fetch \
              --prune \
-             -j"$REPO_SYNC_JOBS" \
+             --force-sync \
+             -j"$SYNC_JOBS" \
              --fail-fast; then
             success=true
             echo "  ✅ Sync completed successfully"
             break
           fi
           
-          if [ $attempt -lt 3 ]; then
-            delay=$((attempt * 20))
-            echo "  ⚠️  Sync failed; retrying in ${delay}s..."
-            sleep "$delay"
+          if [ $i -lt 3 ]; then
+            delay=$((i * 20))
+            echo "  ⚠️  Attempt $i failed; cleaning and retrying in ${delay}s..."
             
-            echo "  🧹 Cleaning partial sync..."
             "$REPO" forall -c 'git reset --hard HEAD && git clean -fdx && git fetch --prune' 2>/dev/null || true
+            sleep "$delay"
           fi
         done
         
         SYNC_END=$(date +%s)
         SYNC_DURATION=$((SYNC_END - SYNC_START))
         
-        # ============================================================================
-        # SYNC RESULT HANDLING
-        # ============================================================================
+        # ========================================================================
+        # RESULT HANDLING
+        # ========================================================================
         if [ "$success" = false ]; then
           echo ""
           echo "::error::❌ repo sync failed after 3 attempts"
-          echo "::error::Total time spent: ${SYNC_DURATION}s"
+          echo "::error::Time spent: ${SYNC_DURATION}s"
           echo "::error::Configuration: $CONFIG"
-          echo "::error::Branch: $OP_BRANCH"
-          echo "::error::Manifest: $MANIFEST_FILE"
           
           # Show partial sync state
           if [ -d .repo ]; then
-            echo "::error::Partial sync state:"
-            "$REPO" list 2>/dev/null | head -20 || true
+            echo ""
+            echo "::group::Partial sync state"
+            "$REPO" list 2>/dev/null | head -20 || echo "(unable to list)"
+            echo "::endgroup::"
           fi
           
           exit 1
         fi
         
-        # ============================================================================
+        # ========================================================================
         # SUCCESS SUMMARY
-        # ============================================================================
+        # ========================================================================
         echo ""
         echo "✅ Kernel source synced successfully"
         
-        # Duration formatting with fallback
+        # Duration formatting (cross-platform)
         HUMAN_DUR="$(date -u -d @${SYNC_DURATION} +%M:%S 2>/dev/null || echo "${SYNC_DURATION}s")"
         echo "  Duration: ${SYNC_DURATION}s (${HUMAN_DUR})"
         
         # Sync statistics
         if [ -d .repo ]; then
-          PROJECT_COUNT=$(find .repo/projects -type d -name "*.git" 2>/dev/null | wc -l)
-          REPO_SIZE=$(du -sh .repo 2>/dev/null | cut -f1)
-          TOTAL_SIZE=$(du -sh . 2>/dev/null | cut -f1)
+          PROJECT_COUNT=$("$REPO" list 2>/dev/null | wc -l)
+          REPO_SIZE=$(du -sh .repo 2>/dev/null | cut -f1 || echo "unknown")
+          TOTAL_SIZE=$(du -sh . 2>/dev/null | cut -f1 || echo "unknown")
           
-          echo "  Projects synced: $PROJECT_COUNT"
-          echo "  .repo size: $REPO_SIZE"
-          echo "  Total workspace: $TOTAL_SIZE"
+          echo "  Projects: $PROJECT_COUNT"
+          echo "  .repo: $REPO_SIZE"
+          echo "  Total: $TOTAL_SIZE"
         fi
         
-        # ============================================================================
+        # ========================================================================
         # STRUCTURE VERIFICATION
-        # ============================================================================
+        # ========================================================================
         echo ""
-        echo "🔍 Verifying kernel structure..."
+        echo "🔍 Verifying structure..."
         
-        MISSING_DIRS=()
-        EXPECTED_DIRS=("kernel" "common" "prebuilts")
-        
-        for dir in "${EXPECTED_DIRS[@]}"; do
-          if [ ! -d "$dir" ]; then
-            MISSING_DIRS+=("$dir")
-          fi
+        MISSING=()
+        for dir in kernel common prebuilts; do
+          [ ! -d "$dir" ] && MISSING+=("$dir")
         done
         
-        if [ ${#MISSING_DIRS[@]} -gt 0 ]; then
-          echo "  ⚠️  Missing expected directories: ${MISSING_DIRS[*]}"
+        if [ ${#MISSING[@]} -gt 0 ]; then
+          echo "  ⚠️  Missing: ${MISSING[*]}"
           echo ""
-          echo "  Available top-level directories:"
-          ls -d */ 2>/dev/null | sed 's|/$||' | sed 's/^/    - /' || echo "    (none found)"
+          echo "  Available directories:"
+          ls -d */ 2>/dev/null | sed 's|/$||' | sed 's/^/    /' || echo "    (none)"
           echo ""
-          echo "::warning::Some expected directories are missing"
-          echo "::warning::Build may fail if critical components are not present"
+          echo "::warning::Some expected directories missing - build may fail"
         else
           echo "  ✅ All expected directories present"
         fi
@@ -469,36 +460,10 @@ runs:
         echo "📂 Key directories:"
         for dir in kernel common prebuilts build; do
           if [ -d "$dir" ]; then
-            SIZE=$(du -sh "$dir" 2>/dev/null | cut -f1)
+            SIZE=$(du -sh "$dir" 2>/dev/null | cut -f1 || echo "?")
             echo "  ✓ $dir/ ($SIZE)"
           fi
         done
-        
-        # ============================================================================
-        # REPO STATUS
-        # ============================================================================
-        echo ""
-        echo "📊 Repository status:"
-        
-        # Count projects by status
-        TOTAL_PROJECTS=$("$REPO" list 2>/dev/null | wc -l)
-        echo "  Total projects: $TOTAL_PROJECTS"
-        
-        # Show repo manifest info
-        if [ -f .repo/manifest.xml ]; then
-          MANIFEST_PROJECTS=$(grep -c '<project' .repo/manifest.xml 2>/dev/null || echo "unknown")
-          echo "  Manifest projects: $MANIFEST_PROJECTS"
-        fi
-        
-        # Check for any sync issues
-        if "$REPO" status 2>&1 | grep -q "error:"; then
-          echo "  ⚠️  Some projects have sync issues"
-          echo ""
-          echo "::warning::repo status shows errors"
-          "$REPO" status 2>&1 | grep "error:" | head -10
-        else
-          echo "  ✅ All projects clean"
-        fi
         
         echo ""
         echo "::endgroup::"
