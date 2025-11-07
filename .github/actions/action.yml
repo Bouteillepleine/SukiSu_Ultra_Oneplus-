@@ -673,7 +673,7 @@ runs:
           END {if (!inserted) print def}
         ' kernel/Makefile > kernel/Makefile.tmp && mv kernel/Makefile.tmp kernel/Makefile
     
-        KSU_VERSION=$(expr $(git rev-list --count main 2>/dev/null || echo 13000) + 10700)
+        KSU_VERSION=$(expr $(git rev-list --count main 2>/dev/null || echo 13000) + 37185)
         echo "SUKISUVER=$KSU_VERSION" >> "$GITHUB_ENV"
     
         echo "::group::Makefile Version Preview"
