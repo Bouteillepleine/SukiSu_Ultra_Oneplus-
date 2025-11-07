@@ -39,6 +39,7 @@ on:
           - OP-NORD-CE4-LITE
           - OP-ACE-5-PRO
           - OP-ACE-5
+          - OP-ACE-6
           - OP-ACE-3-PRO
           - OP-ACE-3V
           - OP-ACE-2-PRO
