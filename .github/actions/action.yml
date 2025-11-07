@@ -217,118 +217,290 @@ runs:
         fi
         echo "::endgroup::"
 
-    - name: Initialize and Sync Kernel Source (Hardened)
+    - name: 🔄 Initialize and Sync Kernel Source
       shell: bash
       run: |
         set -euo pipefail
         echo "::group::Initialize kernel source"
         
-        # Git environment hardening for CI
-        export GIT_ASKPASS=/bin/true
-        export GIT_TERMINAL_PROMPT=0
-        git config --global gc.auto 0 || true
-        git config --global fetch.prune true || true
-        git config --global http.postBuffer 524288000 || true
+        # ============================================================================
+        # CONFIGURATION SUMMARY
+        # ============================================================================
+        echo "📋 Configuration:"
+        echo "  Model: $CONFIG"
+        echo "  Branch: $OP_BRANCH"
+        echo "  Manifest: $OP_MANIFEST"
+        echo "  Repo version: v2.16"
+        echo ""
         
-        CONFIG="${CONFIG:-kernel_src}"
-        echo "Creating folder for configuration: $CONFIG"
+        # ============================================================================
+        # WORKSPACE SETUP
+        # ============================================================================
+        echo "📁 Creating workspace: $CONFIG"
         mkdir -p "$CONFIG"
         cd "$CONFIG"
         
-        # Use local repo if system repo not available
-        REPO="${REPO:-repo}"
-        if ! command -v "$REPO" >/dev/null 2>&1; then
-          echo "Downloading repo tool..."
-          curl -sSL https://storage.googleapis.com/git-repo-downloads/repo -o ./repo
-          chmod +x ./repo
-          REPO="./repo"
-        fi
+        # ============================================================================
+        # MANIFEST HANDLING
+        # ============================================================================
+        echo "🔧 Initializing repo..."
         
-        echo "Initializing kernel source..."
-        
-        # Handle manifest URL or filename
         if [[ "$OP_MANIFEST" == https://* ]]; then
-          mkdir -p .repo/manifests
-          curl --fail --show-error --location --proto '=https' \
-            --retry 3 --retry-delay 2 --connect-timeout 30 \
-            "$OP_MANIFEST" -o .repo/manifests/temp_manifest.xml
+          echo "  Mode: Direct URL download"
+          echo "  URL: $OP_MANIFEST"
           
-          "$REPO" init -u https://github.com/OnePlusOSS/kernel_manifest.git \
-            -b "$OP_BRANCH" \
-            -m temp_manifest.xml \
-            --repo-rev=v2.16 \
-            --depth=1 \
-            --no-clone-bundle \
-            --no-tags \
-            --current-branch
+          mkdir -p .repo/manifests
+          
+          # Download manifest with timeout protection
+          if ! curl --fail --show-error --location --proto '=https' \
+               --connect-timeout 30 --max-time 300 \
+               "$OP_MANIFEST" -o .repo/manifests/temp_manifest.xml; then
+            echo "::error::Failed to download manifest from: $OP_MANIFEST"
+            exit 1
+          fi
+          
+          # Validate downloaded manifest
+          MANIFEST_SIZE=$(stat -c%s .repo/manifests/temp_manifest.xml)
+          echo "  ✅ Downloaded manifest (${MANIFEST_SIZE} bytes)"
+          
+          # XML validation
+          if command -v xmllint >/dev/null 2>&1; then
+            if ! xmllint --noout .repo/manifests/temp_manifest.xml; then
+              echo "::error::Manifest XML invalid: $OP_MANIFEST"
+              exit 1
+            fi
+            echo "  ✅ XML validation passed"
+          else
+            echo "::warning::xmllint not found; skipping XML validation"
+          fi
+          
+          # Size sanity check
+          if [ "$MANIFEST_SIZE" -lt 200 ]; then
+            echo "::warning::Manifest file is quite small (${MANIFEST_SIZE} bytes)"
+            echo "::warning::This might indicate an incomplete download or error page"
+          fi
+          
+          MANIFEST_FILE="temp_manifest.xml"
         else
-          "$REPO" init -u https://github.com/OnePlusOSS/kernel_manifest.git \
-            -b "$OP_BRANCH" \
-            -m "$OP_MANIFEST" \
-            --repo-rev=v2.16 \
-            --depth=1 \
-            --no-clone-bundle \
-            --no-tags \
-            --current-branch
+          echo "  Mode: Repository manifest"
+          echo "  File: $OP_MANIFEST"
+          MANIFEST_FILE="$OP_MANIFEST"
         fi
         
-        # Create manifests_fallback for later TRUSTY check
-        echo "Backing up manifests for reference..."
-        mkdir -p .repo/manifests_fallback
-        cp -a .repo/manifests/* .repo/manifests_fallback/ 2>/dev/null || true
+        # ============================================================================
+        # REPO TOOL VERIFICATION
+        # ============================================================================
+        command -v "$REPO" >/dev/null 2>&1 || {
+          echo "::error::repo tool not found at: $REPO"
+          echo "::error::PATH: $PATH"
+          echo "::error::Available commands:"
+          compgen -c | grep -i repo || echo "  (none found)"
+          exit 1
+        }
         
+        echo "  ✅ repo tool: $REPO"
+        
+        # ============================================================================
+        # REPO INITIALIZATION WITH RETRY
+        # ============================================================================
+        echo ""
+        echo "🔧 Running repo init..."
+        
+        INIT_SUCCESS=false
+        for attempt in 1 2 3; do
+          if [ $attempt -gt 1 ]; then
+            echo "  Attempt $attempt/3..."
+          fi
+          
+          if "$REPO" init \
+             -u https://github.com/OnePlusOSS/kernel_manifest.git \
+             -b "$OP_BRANCH" \
+             -m "$MANIFEST_FILE" \
+             --repo-rev=v2.16 \
+             --depth=1 \
+             --no-clone-bundle \
+             --no-tags; then
+            INIT_SUCCESS=true
+            echo "  ✅ repo init successful"
+            break
+          fi
+          
+          if [ $attempt -lt 3 ]; then
+            echo "  ⚠️  repo init attempt $attempt failed; retrying in 10s..."
+            sleep 10
+          fi
+        done
+        
+        if [ "$INIT_SUCCESS" = false ]; then
+          echo "::error::repo init failed after 3 attempts"
+          echo "::error::Branch: $OP_BRANCH"
+          echo "::error::Manifest: $MANIFEST_FILE"
+          exit 1
+        fi
+        
+        # Show repo version
+        echo ""
         "$REPO" --version
         
-        echo "Syncing kernel source with parallel optimization..."
+        # ============================================================================
+        # SYNC ENVIRONMENT TUNING
+        # ============================================================================
+        echo ""
+        echo "⚙️  Configuring sync environment..."
         
-        # First attempt: full parallelism
-        if ! "$REPO" sync -c \
+        export REPO_SYNC_JOBS="$(nproc --all)"
+        export GIT_HTTP_LOW_SPEED_LIMIT=1000
+        export GIT_HTTP_LOW_SPEED_TIME=60
+        
+        echo "  Parallel jobs: $REPO_SYNC_JOBS"
+        echo "  HTTP low speed limit: ${GIT_HTTP_LOW_SPEED_LIMIT} bytes/s"
+        echo "  HTTP low speed timeout: ${GIT_HTTP_LOW_SPEED_TIME}s"
+        
+        # ============================================================================
+        # KERNEL SOURCE SYNC WITH RETRY
+        # ============================================================================
+        echo ""
+        echo "📥 Syncing kernel source..."
+        echo "  Options: force-sync, optimized-fetch, prune, fail-fast"
+        echo ""
+        
+        SYNC_START=$(date +%s)
+        success=false
+        
+        for attempt in 1 2 3; do
+          echo "🔄 Sync attempt $attempt/3..."
+          
+          if "$REPO" sync -c \
+             --force-sync \
              --no-clone-bundle \
              --no-tags \
              --optimized-fetch \
              --prune \
-             --fail-fast \
-             --force-sync \
-             -j"$(nproc --all)"; then
-          
-          echo "⚠️ First sync failed, retrying with reduced parallelism..."
-          
-          # Retry with -j4 for stability
-          if ! "$REPO" sync -c \
-               --no-clone-bundle \
-               --no-tags \
-               --optimized-fetch \
-               --prune \
-               --force-sync \
-               -j4; then
-            
-            echo "⚠️ Second sync failed, final attempt with -j1..."
-            
-            # Final retry: serial sync
-            "$REPO" sync -c \
-              --no-clone-bundle \
-              --no-tags \
-              --optimized-fetch \
-              --prune \
-              --force-sync \
-              -j1
+             -j"$REPO_SYNC_JOBS" \
+             --fail-fast; then
+            success=true
+            echo "  ✅ Sync completed successfully"
+            break
           fi
+          
+          if [ $attempt -lt 3 ]; then
+            delay=$((attempt * 20))
+            echo "  ⚠️  Sync failed; retrying in ${delay}s..."
+            sleep "$delay"
+            
+            echo "  🧹 Cleaning partial sync..."
+            "$REPO" forall -c 'git reset --hard HEAD && git clean -fdx && git fetch --prune' 2>/dev/null || true
+          fi
+        done
+        
+        SYNC_END=$(date +%s)
+        SYNC_DURATION=$((SYNC_END - SYNC_START))
+        
+        # ============================================================================
+        # SYNC RESULT HANDLING
+        # ============================================================================
+        if [ "$success" = false ]; then
+          echo ""
+          echo "::error::❌ repo sync failed after 3 attempts"
+          echo "::error::Total time spent: ${SYNC_DURATION}s"
+          echo "::error::Configuration: $CONFIG"
+          echo "::error::Branch: $OP_BRANCH"
+          echo "::error::Manifest: $MANIFEST_FILE"
+          
+          # Show partial sync state
+          if [ -d .repo ]; then
+            echo "::error::Partial sync state:"
+            "$REPO" list 2>/dev/null | head -20 || true
+          fi
+          
+          exit 1
         fi
         
-        # Generate locked manifest for reproducibility
-        echo "Generating locked manifest..."
-        "$REPO" manifest -r -o manifest-locked.xml || true
-        
-        # List synced projects
+        # ============================================================================
+        # SUCCESS SUMMARY
+        # ============================================================================
         echo ""
-        echo "Synced projects:"
-        "$REPO" list -p | sed 's/^/  - /' | head -n 20
-        
-        PROJECT_COUNT=$("$REPO" list -p | wc -l)
-        echo ""
-        echo "Total projects: $PROJECT_COUNT"
-        
         echo "✅ Kernel source synced successfully"
+        
+        # Duration formatting with fallback
+        HUMAN_DUR="$(date -u -d @${SYNC_DURATION} +%M:%S 2>/dev/null || echo "${SYNC_DURATION}s")"
+        echo "  Duration: ${SYNC_DURATION}s (${HUMAN_DUR})"
+        
+        # Sync statistics
+        if [ -d .repo ]; then
+          PROJECT_COUNT=$(find .repo/projects -type d -name "*.git" 2>/dev/null | wc -l)
+          REPO_SIZE=$(du -sh .repo 2>/dev/null | cut -f1)
+          TOTAL_SIZE=$(du -sh . 2>/dev/null | cut -f1)
+          
+          echo "  Projects synced: $PROJECT_COUNT"
+          echo "  .repo size: $REPO_SIZE"
+          echo "  Total workspace: $TOTAL_SIZE"
+        fi
+        
+        # ============================================================================
+        # STRUCTURE VERIFICATION
+        # ============================================================================
+        echo ""
+        echo "🔍 Verifying kernel structure..."
+        
+        MISSING_DIRS=()
+        EXPECTED_DIRS=("kernel" "common" "prebuilts")
+        
+        for dir in "${EXPECTED_DIRS[@]}"; do
+          if [ ! -d "$dir" ]; then
+            MISSING_DIRS+=("$dir")
+          fi
+        done
+        
+        if [ ${#MISSING_DIRS[@]} -gt 0 ]; then
+          echo "  ⚠️  Missing expected directories: ${MISSING_DIRS[*]}"
+          echo ""
+          echo "  Available top-level directories:"
+          ls -d */ 2>/dev/null | sed 's|/$||' | sed 's/^/    - /' || echo "    (none found)"
+          echo ""
+          echo "::warning::Some expected directories are missing"
+          echo "::warning::Build may fail if critical components are not present"
+        else
+          echo "  ✅ All expected directories present"
+        fi
+        
+        # Show key directories
+        echo ""
+        echo "📂 Key directories:"
+        for dir in kernel common prebuilts build; do
+          if [ -d "$dir" ]; then
+            SIZE=$(du -sh "$dir" 2>/dev/null | cut -f1)
+            echo "  ✓ $dir/ ($SIZE)"
+          fi
+        done
+        
+        # ============================================================================
+        # REPO STATUS
+        # ============================================================================
+        echo ""
+        echo "📊 Repository status:"
+        
+        # Count projects by status
+        TOTAL_PROJECTS=$("$REPO" list 2>/dev/null | wc -l)
+        echo "  Total projects: $TOTAL_PROJECTS"
+        
+        # Show repo manifest info
+        if [ -f .repo/manifest.xml ]; then
+          MANIFEST_PROJECTS=$(grep -c '<project' .repo/manifest.xml 2>/dev/null || echo "unknown")
+          echo "  Manifest projects: $MANIFEST_PROJECTS"
+        fi
+        
+        # Check for any sync issues
+        if "$REPO" status 2>&1 | grep -q "error:"; then
+          echo "  ⚠️  Some projects have sync issues"
+          echo ""
+          echo "::warning::repo status shows errors"
+          "$REPO" status 2>&1 | grep "error:" | head -10
+        else
+          echo "  ✅ All projects clean"
+        fi
+        
+        echo ""
         echo "::endgroup::"
 
     - name: Get Kernel Version Info
