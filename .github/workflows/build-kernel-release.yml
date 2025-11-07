@@ -151,14 +151,55 @@ jobs:
           EOF
 
   build:
-    needs: setup
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
-    steps:
+      needs: setup
+      runs-on: ubuntu-latest
+      timeout-minutes: 180  # 3-hour timeout
+      strategy:
+        fail-fast: false
+        matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+      steps:
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
+      
+      - name: 🧹 Emergency Disk Cleanup
+        run: |
+          echo "::group::Disk Usage Before Cleanup"
+          df -h
+          
+          AVAIL_GB=$(df -BG / | awk 'NR==2 {print $4}' | sed 's/G//')
+          if [ "$AVAIL_GB" -lt 25 ]; then
+            echo "::warning::Low disk space detected: ${AVAIL_GB}GB available"
+            echo "::warning::Build may fail if space runs out"
+          fi
+          echo "::endgroup::"
+          
+          echo "::group::Removing Unnecessary Software"
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          
+          if command -v docker >/dev/null 2>&1; then
+            docker rmi $(docker images -q) 2>/dev/null || true
+            sudo systemctl stop docker 2>/dev/null || true
+          fi
+          
+          sudo rm -rf ~/.cache 2>/dev/null || true
+          sudo rm -rf ~/.npm 2>/dev/null || true
+          sudo rm -rf ~/.local/share/Trash 2>/dev/null || true
+          echo "::endgroup::"
+          
+          echo "::group::Disk Usage After Cleanup"
+          df -h
+          AVAIL_GB=$(df -BG / | awk 'NR==2 {print $4}' | sed 's/G//')
+          echo "✅ Available space: ${AVAIL_GB}GB"
+          
+          if [ "$AVAIL_GB" -lt 25 ]; then
+            echo "::error::Insufficient disk space after cleanup: ${AVAIL_GB}GB"
+            exit 1
+          fi
+          echo "::endgroup::"
 
       - name: 🔨 Build ${{ matrix.model }}
         id: build
@@ -249,6 +290,58 @@ jobs:
           **SHA256:** \`${{ steps.build.outputs.zip_sha256 }}\`
           EOF
           fi
+      
+      - name: 🧹 Final cleanup and space report
+        if: always()
+        run: |
+          echo "::group::Final Cleanup"
+          
+          # Show space before cleanup
+          echo "📊 Disk usage before cleanup:"
+          df -h / | grep -E '^Filesystem|/$'
+          BEFORE=$(df -BG / | awk 'NR==2 {print $3}' | sed 's/G//')
+          echo ""
+          
+          # Remove build artifacts but PRESERVE ccache
+          echo "🗑️ Removing temporary build files..."
+          sudo rm -rf "$GITHUB_WORKSPACE/out" || true
+          sudo rm -rf "$GITHUB_WORKSPACE/build" || true
+          sudo rm -rf "$GITHUB_WORKSPACE/kernel/out" || true
+          sudo rm -rf "$GITHUB_WORKSPACE/.repo" || true
+          sudo rm -rf /tmp/* || true
+          sudo rm -rf /var/tmp/* || true
+          
+          echo "✅ Temporary files removed"
+          echo ""
+          
+          # Show ccache stats (don't clear it!)
+          if command -v ccache >/dev/null 2>&1; then
+            echo "📊 ccache statistics after build:"
+            ccache -s | grep -E 'cache size|files in cache|cache hit rate'
+            
+            CCACHE_SIZE=$(ccache -s | grep 'cache size' | awk '{print $3, $4}')
+            echo ""
+            echo "💾 ccache preserved (${CCACHE_SIZE}) for next build"
+          fi
+          
+          echo ""
+          echo "💽 Final disk usage:"
+          df -h / | grep -E '^Filesystem|/$'
+          
+          AFTER=$(df -BG / | awk 'NR==2 {print $3}' | sed 's/G//')
+          AVAIL_GB=$(df -BG / | awk 'NR==2 {print $4}' | sed 's/G//')
+          FREED=$((BEFORE - AFTER))
+          
+          echo ""
+          echo "✅ Cleanup complete:"
+          echo "   - Freed: ${FREED}GB"
+          echo "   - Available: ${AVAIL_GB}GB"
+          
+          if [ "$AVAIL_GB" -lt 10 ]; then
+            echo "::warning::Low disk space remaining: ${AVAIL_GB}GB"
+          fi
+          
+          echo "::endgroup::"
 
   release:
     if: ${{ inputs.make_release }}
