@@ -95,23 +95,49 @@ concurrency:
 
 jobs:
   analyze:
+    name: 📊 Analyze Cache Health
     runs-on: ubuntu-latest
     outputs:
-      should_cleanup: ${{ steps.analysis.outputs.should_cleanup }}
-      total_cache_size: ${{ steps.analysis.outputs.total_size }}
-      cache_count: ${{ steps.analysis.outputs.cache_count }}
-      usage_percent: ${{ steps.analysis.outputs.usage_percent }}
-      ccache_count: ${{ steps.analysis.outputs.ccache_count }}
-      ccache_size: ${{ steps.analysis.outputs.ccache_size }}
-    
+      total_size: ${{ steps.analyze.outputs.total_size }}
+      total_count: ${{ steps.analyze.outputs.total_count }}
+      health_status: ${{ steps.analyze.outputs.health_status }}
+      recommendation: ${{ steps.analyze.outputs.recommendation }}
+      cache_data: ${{ steps.analyze.outputs.cache_data }}
+      
     steps:
-      - name: 📊 Analyze Repository Cache Health
-        id: analysis
+      - name: 🔍 Fetch and Analyze Caches
+        id: analyze
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const { owner, repo } = context.repo;
-            const forceCleanup = '${{ inputs.force_cleanup }}' === 'true';
+            const MAX_SIZE_GB = 10;
+            const MAX_SIZE_BYTES = MAX_SIZE_GB * 1024 * 1024 * 1024;
+            
+            // ✅ UPDATED: Tolerant v3 regex that accepts both ccache-v3-* and ccache-suki-v3-*
+            const CACHE_PATTERNS = {
+              // v4 format: ccache-suki-v4-MODEL-OS-ANDROID-KERNEL-CLANG
+              v4: /^ccache-suki-v4-([^-]+)-([^-]+)-([^-]+)-([^-]+)-([^-]+)$/,
+              
+              // ✅ NEW: Tolerant v3 format that accepts both forms
+              // Matches: ccache-v3-* AND ccache-suki-v3-*
+              // Groups: (1) android, (2) kernel, (3) device
+              v3: /^ccache-(?:suki-)?v3-([^-]+)-([0-9.]+)-(?:[A-Za-z0-9.-]+-)?(?:clang-[A-Za-z0-9.-]+-)?([A-Za-z0-9._-]+)(?:-.+)?$/,
+              
+              // Legacy formats
+              legacy1: /^ccache-[^-]+-[\d.]+-[^-]+-clang-[^-]+-([^-]+)$/,
+              legacy2: /^ccache-[^-]+-[\d.]+-[^-]+-([^-]+)$/,
+              legacy3: /ccache-[^-]+-[^-]+-[^-]+-[^-]+-([^-]+)/
+            };
+            
+            // ✅ NEW: Safe number formatting helpers
+            const toGB = bytes => bytes / 1024 / 1024 / 1024;
+            const fmtGB = (bytes, countHint = 0) => {
+              if (bytes === 0 && countHint > 0) return '0.00'; // brand-new cache
+              const g = toGB(bytes);
+              return g > 0 && g < 0.01 ? '<0.01' : g.toFixed(2);
+            };
+            const pct = (part, total) => total > 0 ? ((part / total) * 100).toFixed(1) + '%' : '0.0%';
             
             async function withRetry(fn, maxRetries = 3) {
               for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -135,195 +161,232 @@ jobs:
               }
             }
             
-            console.log('🔍 Analyzing repository cache health...\n');
+            console.log('Fetching repository caches...');
+            const caches = await github.paginate(
+              github.rest.actions.getActionsCacheList,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100
+              }
+            );
             
-            let totalCacheSize = 0;
-            let cacheCount = 0;
-            const allCaches = [];
+            console.log(`Found ${caches.length} total caches`);
             
-            const cachesByType = {
-              ccache: { size: 0, count: 0 },
-              apt: { size: 0, count: 0 },
-              kernel: { size: 0, count: 0 },
-              other: { size: 0, count: 0 }
+            // Initialize statistics
+            const stats = {
+              totalSize: 0,
+              totalCount: caches.length,
+              cachesByType: {
+                ccache: { size: 0, count: 0 },
+                apt: { size: 0, count: 0 },
+                kernel: { size: 0, count: 0 },
+                other: { size: 0, count: 0 }
+              },
+              cacheKeyVersions: {
+                v4: 0,
+                v3: 0,
+                legacy: 0
+              },
+              cachesByDevice: new Map(),
+              ageDistribution: {
+                fresh: 0,      // < 7 days
+                recent: 0,     // 7-14 days
+                old: 0,        // 14-30 days
+                stale: 0       // > 30 days
+              },
+              activityDistribution: {
+                active: 0,     // < 7 days
+                recent: 0,     // 7-14 days
+                dormant: 0,    // 14-30 days
+                stale: 0       // > 30 days
+              },
+              oldestCache: null,
+              newestCache: null
             };
             
-            const cachesByDevice = new Map();
-            const cacheKeyVersions = { v4: 0, v3: 0, legacy: 0 };
+            const now = new Date();
+            const msPerDay = 24 * 60 * 60 * 1000;
             
-            const cacheAgeDistribution = {
-              fresh: 0,
-              recent: 0,
-              old: 0,
-              stale: 0
-            };
-            
-            const lastAccessDistribution = {
-              active: 0,
-              recent: 0,
-              dormant: 0,
-              stale: 0
-            };
-            
-            let page = 1;
-            while (true) {
-              const res = await withRetry(() =>
-                github.rest.actions.getActionsCacheList({
-                  owner,
-                  repo,
-                  per_page: 100,
-                  page: page
-                })
-              );
+            // Process each cache
+            for (const cache of caches) {
+              stats.totalSize += cache.size_in_bytes;
               
-              const caches = res.data.actions_caches;
-              if (!caches || caches.length === 0) break;
+              const cacheDate = new Date(cache.created_at);
+              const lastAccessDate = new Date(cache.last_accessed_at);
+              const ageInDays = (now - cacheDate) / msPerDay;
+              const daysSinceAccess = (now - lastAccessDate) / msPerDay;
               
-              for (const cache of caches) {
-                totalCacheSize += cache.size_in_bytes;
-                cacheCount++;
-                allCaches.push(cache);
-                
-                const cacheDate = new Date(cache.created_at);
-                const lastAccessDate = new Date(cache.last_accessed_at || cache.created_at);
-                const ageDays = Math.floor((new Date() - cacheDate) / (1000 * 60 * 60 * 24));
-                const accessAgeDays = Math.floor((new Date() - lastAccessDate) / (1000 * 60 * 60 * 24));
-                
-                if (ageDays < 7) cacheAgeDistribution.fresh++;
-                else if (ageDays < 14) cacheAgeDistribution.recent++;
-                else if (ageDays < 30) cacheAgeDistribution.old++;
-                else cacheAgeDistribution.stale++;
-                
-                if (accessAgeDays < 7) lastAccessDistribution.active++;
-                else if (accessAgeDays < 14) lastAccessDistribution.recent++;
-                else if (accessAgeDays < 30) lastAccessDistribution.dormant++;
-                else lastAccessDistribution.stale++;
-                
-                if (cache.key.startsWith('ccache-')) {
-                  cachesByType.ccache.size += cache.size_in_bytes;
-                  cachesByType.ccache.count++;
-                  
-                  // ✅ UPDATED: Support both v4 and v3 formats with 'suki' prefix
-                  const isV4Format = cache.key.startsWith('ccache-suki-v4-');
-                  const isV3Format = cache.key.startsWith('ccache-suki-v3-');
-                  
-                  if (isV4Format) {
-                    cacheKeyVersions.v4++;
-                  } else if (isV3Format) {
-                    cacheKeyVersions.v3++;
-                  } else {
-                    cacheKeyVersions.legacy++;
-                  }
-                  
-                  let device = null;
-                  let osVersion = null;
-                  let androidVer = null;
-                  let kernelVer = null;
-                  
-                  // ✅ UPDATED: Parse v4 format (ccache-suki-v4-MODEL-OS-ANDROID-KERNEL-CLANG-BRANCH)
-                  if (isV4Format) {
-                    const v4Match = cache.key.match(/^ccache-suki-v4-([^-]+)-([^-]+)-([^-]+)-([^-]+)-([^-]+)(?:-([^-]+))?$/);
-                    if (v4Match) {
-                      device = v4Match[1];        // OP13
-                      osVersion = v4Match[2];     // OOS15
-                      androidVer = v4Match[3];    // android14
-                      kernelVer = v4Match[4];     // 6.1
-                      // clangVer = v4Match[5];   // r510928
-                      // branch = v4Match[6];     // stable (optional)
-                    }
-                  } else if (isV3Format) {
-                    const v3Match = cache.key.match(/^ccache-suki-v3-([^-]+-[\d.]+)-([A-Za-z0-9.-]+(?:-[A-Za-z0-9.-]+)*)-(clang-[A-Za-z0-9.-]+)-([A-Za-z0-9._-]+)(-stable)?$/);
-                    if (v3Match) {
-                      osVersion = v3Match[2];
-                      device = v3Match[4];
-                    }
-                  } else {
-                    // Legacy format parsing
-                    const legacy1 = cache.key.match(/^ccache-[^-]+-[\d.]+-[^-]+-clang-[^-]+-([^-]+)$/);
-                    const legacy2 = cache.key.match(/^ccache-[^-]+-[\d.]+-[^-]+-([^-]+)$/);
-                    const legacy3 = cache.key.match(/ccache-[^-]+-[^-]+-[^-]+-[^-]+-([^-]+)/);
-                    
-                    device = legacy1?.[1] || legacy2?.[1] || legacy3?.[1] || null;
-                  }
-                  
-                  if (device) {
-                    if (!cachesByDevice.has(device)) {
-                      cachesByDevice.set(device, {
-                        size: 0,
-                        count: 0,
-                        lastAccessed: lastAccessDate,
-                        oldestCache: cacheDate,
-                        newestCache: cacheDate,
-                        oldestAccess: lastAccessDate,
-                        newestAccess: lastAccessDate,
-                        osVersions: new Set(),
-                        v4Count: 0,
-                        v3Count: 0,
-                        legacyCount: 0
-                      });
-                    }
-                    
-                    const deviceData = cachesByDevice.get(device);
-                    deviceData.size += cache.size_in_bytes;
-                    deviceData.count++;
-                    
-                    // ✅ UPDATED: Track v4, v3, and legacy counts
-                    if (isV4Format) deviceData.v4Count++;
-                    else if (isV3Format) deviceData.v3Count++;
-                    else deviceData.legacyCount++;
-                    
-                    if (osVersion) deviceData.osVersions.add(osVersion);
-                    
-                    if (lastAccessDate > deviceData.lastAccessed) {
-                      deviceData.lastAccessed = lastAccessDate;
-                    }
-                    if (cacheDate < deviceData.oldestCache) {
-                      deviceData.oldestCache = cacheDate;
-                    }
-                    if (cacheDate > deviceData.newestCache) {
-                      deviceData.newestCache = cacheDate;
-                    }
-                    if (lastAccessDate < deviceData.oldestAccess) {
-                      deviceData.oldestAccess = lastAccessDate;
-                    }
-                    if (lastAccessDate > deviceData.newestAccess) {
-                      deviceData.newestAccess = lastAccessDate;
-                    }
-                  }
-                } else if (cache.key.startsWith('apt-')) {
-                  cachesByType.apt.size += cache.size_in_bytes;
-                  cachesByType.apt.count++;
-                } else if (cache.key.includes('kernel') || cache.key.includes('linux-')) {
-                  cachesByType.kernel.size += cache.size_in_bytes;
-                  cachesByType.kernel.count++;
-                } else {
-                  cachesByType.other.size += cache.size_in_bytes;
-                  cachesByType.other.count++;
-                }
+              // Track oldest/newest
+              if (!stats.oldestCache || cacheDate < new Date(stats.oldestCache.created_at)) {
+                stats.oldestCache = cache;
+              }
+              if (!stats.newestCache || cacheDate > new Date(stats.newestCache.created_at)) {
+                stats.newestCache = cache;
               }
               
-              if (caches.length < 100) break;
-              page++;
+              // Age distribution
+              if (ageInDays < 7) stats.ageDistribution.fresh++;
+              else if (ageInDays < 14) stats.ageDistribution.recent++;
+              else if (ageInDays < 30) stats.ageDistribution.old++;
+              else stats.ageDistribution.stale++;
+              
+              // Activity distribution
+              if (daysSinceAccess < 7) stats.activityDistribution.active++;
+              else if (daysSinceAccess < 14) stats.activityDistribution.recent++;
+              else if (daysSinceAccess < 30) stats.activityDistribution.dormant++;
+              else stats.activityDistribution.stale++;
+              
+              // Categorize by type
+              if (cache.key.startsWith('ccache-')) {
+                stats.cachesByType.ccache.size += cache.size_in_bytes;
+                stats.cachesByType.ccache.count++;
+                
+                // ✅ UPDATED: Parse cache key format with tolerant v3 regex
+                let device = null;
+                let osVersion = null;
+                let androidVer = null;
+                let kernelVer = null;
+                let isV4 = false;
+                let isV3 = false;
+                
+                // Try v4 format first
+                const v4Match = cache.key.match(CACHE_PATTERNS.v4);
+                if (v4Match) {
+                  stats.cacheKeyVersions.v4++;
+                  isV4 = true;
+                  device = v4Match[1];        // OP13
+                  osVersion = v4Match[2];     // OOS15
+                  androidVer = v4Match[3];    // android14
+                  kernelVer = v4Match[4];     // 6.1
+                  // clangVer = v4Match[5];   // r510928
+                } 
+                // ✅ UPDATED: Try tolerant v3 format (accepts both ccache-v3-* and ccache-suki-v3-*)
+                else {
+                  const v3Match = cache.key.match(CACHE_PATTERNS.v3);
+                  if (v3Match) {
+                    stats.cacheKeyVersions.v3++;
+                    isV3 = true;
+                    androidVer = v3Match[1];  // android14
+                    kernelVer = v3Match[2];   // 6.1
+                    device = v3Match[3];      // OP-ACE-5 or OP-ACE-3V
+                  }
+                  // Try legacy formats
+                  else {
+                    stats.cacheKeyVersions.legacy++;
+                    const legacy1 = cache.key.match(CACHE_PATTERNS.legacy1);
+                    const legacy2 = cache.key.match(CACHE_PATTERNS.legacy2);
+                    const legacy3 = cache.key.match(CACHE_PATTERNS.legacy3);
+                    device = legacy1?.[1] || legacy2?.[1] || legacy3?.[1] || null;
+                  }
+                }
+                
+                // Track by device
+                if (device) {
+                  if (!stats.cachesByDevice.has(device)) {
+                    stats.cachesByDevice.set(device, {
+                      size: 0,
+                      count: 0,
+                      lastAccessed: lastAccessDate,
+                      oldestCache: cacheDate,
+                      newestCache: cacheDate,
+                      oldestAccess: lastAccessDate,
+                      newestAccess: lastAccessDate,
+                      osVersions: new Set(),
+                      androidVersions: new Set(),
+                      kernelVersions: new Set(),
+                      v4Count: 0,
+                      v3Count: 0,
+                      legacyCount: 0
+                    });
+                  }
+                  
+                  const deviceData = stats.cachesByDevice.get(device);
+                  deviceData.size += cache.size_in_bytes;
+                  deviceData.count++;
+                  
+                  // Track format versions
+                  if (isV4) deviceData.v4Count++;
+                  else if (isV3) deviceData.v3Count++;
+                  else deviceData.legacyCount++;
+                  
+                  // Track versions
+                  if (osVersion) deviceData.osVersions.add(osVersion);
+                  if (androidVer) deviceData.androidVersions.add(androidVer);
+                  if (kernelVer) deviceData.kernelVersions.add(kernelVer);
+                  
+                  // Update timestamps
+                  if (lastAccessDate > deviceData.lastAccessed) {
+                    deviceData.lastAccessed = lastAccessDate;
+                  }
+                  if (cacheDate < deviceData.oldestCache) {
+                    deviceData.oldestCache = cacheDate;
+                  }
+                  if (cacheDate > deviceData.newestCache) {
+                    deviceData.newestCache = cacheDate;
+                  }
+                  if (lastAccessDate < deviceData.oldestAccess) {
+                    deviceData.oldestAccess = lastAccessDate;
+                  }
+                  if (lastAccessDate > deviceData.newestAccess) {
+                    deviceData.newestAccess = lastAccessDate;
+                  }
+                }
+              } 
+              else if (cache.key.includes('apt-')) {
+                stats.cachesByType.apt.size += cache.size_in_bytes;
+                stats.cachesByType.apt.count++;
+              } 
+              else if (cache.key.includes('kernel-source')) {
+                stats.cachesByType.kernel.size += cache.size_in_bytes;
+                stats.cachesByType.kernel.count++;
+              } 
+              else {
+                stats.cachesByType.other.size += cache.size_in_bytes;
+                stats.cachesByType.other.count++;
+              }
             }
             
-            const totalSizeGB = (totalCacheSize / 1024 / 1024 / 1024).toFixed(2);
-            const maxCacheSize = 10 * 1024 * 1024 * 1024;
-            const usagePercent = ((totalCacheSize / maxCacheSize) * 100).toFixed(1);
+            // ✅ UPDATED: Safe usage percent calculation
+            const usagePercent = stats.totalSize > 0 ? (stats.totalSize / MAX_SIZE_BYTES) * 100 : 0;
+            const usagePercentStr = usagePercent.toFixed(1);
+            
+            let healthStatus = 'Healthy';
+            let recommendation = '✅ No action needed';
+            
+            if (usagePercent > 90) {
+              healthStatus = 'Critical';
+              recommendation = '🚨 Immediate cleanup required';
+            } else if (usagePercent > 75) {
+              healthStatus = 'Warning';
+              recommendation = '⚠️ Consider cleanup soon';
+            } else if (usagePercent > 50) {
+              healthStatus = 'Caution';
+              recommendation = '💡 Monitor usage';
+            }
+            
+            // Convert Map to Array for JSON serialization
+            const deviceArray = Array.from(stats.cachesByDevice.entries()).map(([device, data]) => ({
+              device,
+              size: data.size,
+              count: data.count,
+              lastAccessed: data.lastAccessed.toISOString(),
+              oldestCache: data.oldestCache.toISOString(),
+              newestCache: data.newestCache.toISOString(),
+              osVersions: Array.from(data.osVersions),
+              androidVersions: Array.from(data.androidVersions),
+              kernelVersions: Array.from(data.kernelVersions),
+              v4Count: data.v4Count,
+              v3Count: data.v3Count,
+              legacyCount: data.legacyCount
+            })).sort((a, b) => b.size - a.size);
+            
+            // ✅ UPDATED: Use safe formatting helpers
+            const totalSizeGB = fmtGB(stats.totalSize, stats.totalCount);
             
             let healthEmoji = '🟢';
-            let healthStatus = 'Healthy';
-            if (parseFloat(usagePercent) > 90) {
-              healthEmoji = '🔴';
-              healthStatus = 'Critical';
-            } else if (parseFloat(usagePercent) > 75) {
-              healthEmoji = '🟡';
-              healthStatus = 'Warning';
-            }
-            
-            console.log(`\n📊 Cache Analysis Complete:`);
-            console.log(`   Total Size: ${totalSizeGB} GB (${usagePercent}% of 10 GB limit)`);
-            console.log(`   Total Caches: ${cacheCount}`);
-            console.log(`   Health: ${healthEmoji} ${healthStatus}\n`);
+            if (usagePercent > 90) healthEmoji = '🔴';
+            else if (usagePercent > 75) healthEmoji = '🟡';
             
             const summary = core.summary
               .addHeading(`${healthEmoji} Repository Cache Health Report`, 2)
@@ -332,97 +395,97 @@ jobs:
             summary.addHeading('📊 Overall Statistics', 3)
               .addTable([
                 [{data: 'Metric', header: true}, {data: 'Value', header: true}, {data: 'Status', header: true}],
-                ['Total Cache Size', `${totalSizeGB} GB`, `${usagePercent}% of 10 GB`],
-                ['Total Cache Count', cacheCount.toString(), healthEmoji],
+                ['Total Cache Size', `${totalSizeGB} GB`, `${usagePercentStr}% of ${MAX_SIZE_GB} GB`],
+                ['Total Cache Count', stats.totalCount.toString(), healthEmoji],
                 ['Health Status', healthStatus, healthEmoji],
-                ['Recommendation', usagePercent > 75 ? '⚠️ Cleanup recommended' : '✅ No action needed', '']
+                ['Recommendation', recommendation, '']
               ]);
             
+            // ✅ UPDATED: Use safe formatting for cache breakdown
             summary.addHeading('🗂️ Cache Breakdown by Type', 3)
               .addTable([
                 [{data: 'Type', header: true}, {data: 'Count', header: true}, {data: 'Size (GB)', header: true}, {data: 'Percentage', header: true}],
                 ['ccache', 
-                 cachesByType.ccache.count.toString(),
-                 (cachesByType.ccache.size / 1024 / 1024 / 1024).toFixed(2),
-                 `${((cachesByType.ccache.size / totalCacheSize) * 100).toFixed(1)}%`],
+                 stats.cachesByType.ccache.count.toString(),
+                 fmtGB(stats.cachesByType.ccache.size, stats.cachesByType.ccache.count),
+                 pct(stats.cachesByType.ccache.size, stats.totalSize)],
                 ['apt packages',
-                 cachesByType.apt.count.toString(),
-                 (cachesByType.apt.size / 1024 / 1024 / 1024).toFixed(2),
-                 `${((cachesByType.apt.size / totalCacheSize) * 100).toFixed(1)}%`],
+                 stats.cachesByType.apt.count.toString(),
+                 fmtGB(stats.cachesByType.apt.size, stats.cachesByType.apt.count),
+                 pct(stats.cachesByType.apt.size, stats.totalSize)],
                 ['kernel sources',
-                 cachesByType.kernel.count.toString(),
-                 (cachesByType.kernel.size / 1024 / 1024 / 1024).toFixed(2),
-                 `${((cachesByType.kernel.size / totalCacheSize) * 100).toFixed(1)}%`],
+                 stats.cachesByType.kernel.count.toString(),
+                 fmtGB(stats.cachesByType.kernel.size, stats.cachesByType.kernel.count),
+                 pct(stats.cachesByType.kernel.size, stats.totalSize)],
                 ['other',
-                 cachesByType.other.count.toString(),
-                 (cachesByType.other.size / 1024 / 1024 / 1024).toFixed(2),
-                 `${((cachesByType.other.size / totalCacheSize) * 100).toFixed(1)}%`]
+                 stats.cachesByType.other.count.toString(),
+                 fmtGB(stats.cachesByType.other.size, stats.cachesByType.other.count),
+                 pct(stats.cachesByType.other.size, stats.totalSize)]
               ]);
             
-            // ✅ UPDATED: Show v4, v3, and legacy breakdown with 'suki' prefix
-            const totalVersionedCaches = cacheKeyVersions.v4 + cacheKeyVersions.v3 + cacheKeyVersions.legacy;
+            // ✅ UPDATED: Clarified v3 label to show both forms accepted
+            const totalVersionedCaches = stats.cacheKeyVersions.v4 + stats.cacheKeyVersions.v3 + stats.cacheKeyVersions.legacy;
             summary.addHeading('🔑 Cache Key Versions', 3)
               .addTable([
                 [{data: 'Format', header: true}, {data: 'Count', header: true}, {data: 'Percentage', header: true}],
                 ['v4 (ccache-suki-v4-*)', 
-                 cacheKeyVersions.v4.toString(),
-                 totalVersionedCaches > 0 ? `${((cacheKeyVersions.v4 / totalVersionedCaches) * 100).toFixed(1)}%` : '0%'],
-                ['v3 (ccache-suki-v3-*)', 
-                 cacheKeyVersions.v3.toString(),
-                 totalVersionedCaches > 0 ? `${((cacheKeyVersions.v3 / totalVersionedCaches) * 100).toFixed(1)}%` : '0%'],
+                 stats.cacheKeyVersions.v4.toString(),
+                 totalVersionedCaches > 0 ? pct(stats.cacheKeyVersions.v4, totalVersionedCaches) : '0.0%'],
+                ['v3 (ccache[-suki]-v3-*)', 
+                 stats.cacheKeyVersions.v3.toString(),
+                 totalVersionedCaches > 0 ? pct(stats.cacheKeyVersions.v3, totalVersionedCaches) : '0.0%'],
                 ['Legacy (old format)',
-                 cacheKeyVersions.legacy.toString(),
-                 totalVersionedCaches > 0 ? `${((cacheKeyVersions.legacy / totalVersionedCaches) * 100).toFixed(1)}%` : '0%']
+                 stats.cacheKeyVersions.legacy.toString(),
+                 totalVersionedCaches > 0 ? pct(stats.cacheKeyVersions.legacy, totalVersionedCaches) : '0.0%']
               ]);
             
-            // ✅ UPDATED: Warnings for v3 and legacy caches
-            if (cacheKeyVersions.v3 > 0) {
-              summary.addRaw(`\n> ℹ️ **v3 Cache Keys Detected**: ${cacheKeyVersions.v3} caches use v3 format. Consider migrating to v4 for consistency.\n\n`);
-            }
-            if (cacheKeyVersions.legacy > 0) {
-              summary.addRaw(`\n> ⚠️ **Legacy Cache Keys Detected**: ${cacheKeyVersions.legacy} caches use old format. Strongly recommend migrating to v4 format.\n\n`);
+            if (stats.cacheKeyVersions.v4 === totalVersionedCaches && totalVersionedCaches > 0) {
+              summary.addRaw(`\n✅ **All caches using v4 format**\n\n`);
+            } else {
+              if (stats.cacheKeyVersions.v3 > 0) {
+                summary.addRaw(`\n> ℹ️ **v3 Caches Detected**: ${stats.cacheKeyVersions.v3} caches use v3 format (both ccache-v3-* and ccache-suki-v3-*). Consider migration to v4.\n\n`);
+              }
+              if (stats.cacheKeyVersions.legacy > 0) {
+                summary.addRaw(`\n> ⚠️ **Legacy Caches Detected**: ${stats.cacheKeyVersions.legacy} caches use old format. Migration to v4 recommended.\n\n`);
+              }
             }
             
             summary.addHeading('📅 Cache Age Distribution (by creation date)', 3)
               .addTable([
                 [{data: 'Age Range', header: true}, {data: 'Count', header: true}, {data: 'Percentage', header: true}],
-                ['< 7 days (Fresh)', cacheAgeDistribution.fresh.toString(), `${((cacheAgeDistribution.fresh / cacheCount) * 100).toFixed(1)}%`],
-                ['7-14 days (Recent)', cacheAgeDistribution.recent.toString(), `${((cacheAgeDistribution.recent / cacheCount) * 100).toFixed(1)}%`],
-                ['14-30 days (Old)', cacheAgeDistribution.old.toString(), `${((cacheAgeDistribution.old / cacheCount) * 100).toFixed(1)}%`],
-                ['> 30 days (Stale)', cacheAgeDistribution.stale.toString(), `${((cacheAgeDistribution.stale / cacheCount) * 100).toFixed(1)}%`]
+                ['< 7 days (Fresh)', stats.ageDistribution.fresh.toString(), pct(stats.ageDistribution.fresh, stats.totalCount)],
+                ['7-14 days (Recent)', stats.ageDistribution.recent.toString(), pct(stats.ageDistribution.recent, stats.totalCount)],
+                ['14-30 days (Old)', stats.ageDistribution.old.toString(), pct(stats.ageDistribution.old, stats.totalCount)],
+                ['> 30 days (Stale)', stats.ageDistribution.stale.toString(), pct(stats.ageDistribution.stale, stats.totalCount)]
               ]);
             
             summary.addHeading('🔄 Activity Distribution (by last access)', 3)
               .addTable([
                 [{data: 'Activity Level', header: true}, {data: 'Count', header: true}, {data: 'Percentage', header: true}],
-                ['< 7 days (Active)', lastAccessDistribution.active.toString(), `${((lastAccessDistribution.active / cacheCount) * 100).toFixed(1)}%`],
-                ['7-14 days (Recent)', lastAccessDistribution.recent.toString(), `${((lastAccessDistribution.recent / cacheCount) * 100).toFixed(1)}%`],
-                ['14-30 days (Dormant)', lastAccessDistribution.dormant.toString(), `${((lastAccessDistribution.dormant / cacheCount) * 100).toFixed(1)}%`],
-                ['> 30 days (Stale)', lastAccessDistribution.stale.toString(), `${((lastAccessDistribution.stale / cacheCount) * 100).toFixed(1)}%`]
+                ['< 7 days (Active)', stats.activityDistribution.active.toString(), pct(stats.activityDistribution.active, stats.totalCount)],
+                ['7-14 days (Recent)', stats.activityDistribution.recent.toString(), pct(stats.activityDistribution.recent, stats.totalCount)],
+                ['14-30 days (Dormant)', stats.activityDistribution.dormant.toString(), pct(stats.activityDistribution.dormant, stats.totalCount)],
+                ['> 30 days (Stale)', stats.activityDistribution.stale.toString(), pct(stats.activityDistribution.stale, stats.totalCount)]
               ]);
             
-            // ===== FIX: Move deviceArray and inactiveDevices to outer scope =====
-            const deviceArray = Array.from(cachesByDevice.entries())
-              .sort((a, b) => b[1].size - a[1].size);
-            
-            const inactiveDevices = deviceArray.filter(([_, data]) => {
-              const daysSinceAccess = Math.floor((new Date() - data.lastAccessed) / (1000 * 60 * 60 * 24));
-              return daysSinceAccess > 30;
-            });
-            
+            // Device breakdown
             if (deviceArray.length > 0) {
-              // ✅ UPDATED: Show v4/v3/Legacy counts per device
+              const inactiveDevices = deviceArray.filter(d => {
+                const daysSinceAccess = (now - new Date(d.lastAccessed)) / msPerDay;
+                return daysSinceAccess > 30;
+              });
+              
               summary.addHeading('📱 Top 15 Devices by Cache Size', 3)
                 .addTable([
                   [{data: 'Device', header: true}, {data: 'Count', header: true}, {data: 'Size (GB)', header: true}, 
                    {data: 'v4/v3/Legacy', header: true}, {data: 'Last Access', header: true}, {data: 'OS Versions', header: true}],
-                  ...deviceArray.slice(0, 15).map(([device, data]) => [
-                    device,
-                    data.count.toString(),
-                    (data.size / 1024 / 1024 / 1024).toFixed(2),
-                    `${data.v4Count}/${data.v3Count}/${data.legacyCount}`,
-                    `${Math.floor((new Date() - data.lastAccessed) / (1000 * 60 * 60 * 24))}d ago`,
-                    Array.from(data.osVersions).join(', ') || 'N/A'
+                  ...deviceArray.slice(0, 15).map(d => [
+                    d.device,
+                    d.count.toString(),
+                    fmtGB(d.size, d.count),
+                    `${d.v4Count}/${d.v3Count}/${d.legacyCount}`,
+                    `${Math.floor((now - new Date(d.lastAccessed)) / msPerDay)}d ago`,
+                    d.osVersions.join(', ') || 'N/A'
                   ])
                 ]);
               
@@ -431,70 +494,72 @@ jobs:
                   .addTable([
                     [{data: 'Device', header: true}, {data: 'Count', header: true}, {data: 'Size (GB)', header: true}, 
                      {data: 'Last Access', header: true}, {data: 'Potential Savings', header: true}],
-                    ...inactiveDevices.slice(0, 10).map(([device, data]) => [
-                      device,
-                      data.count.toString(),
-                      (data.size / 1024 / 1024 / 1024).toFixed(2),
-                      `${Math.floor((new Date() - data.lastAccessed) / (1000 * 60 * 60 * 24))}d ago`,
-                      `${((data.size / totalCacheSize) * 100).toFixed(1)}%`
+                    ...inactiveDevices.slice(0, 10).map(d => [
+                      d.device,
+                      d.count.toString(),
+                      fmtGB(d.size, d.count),
+                      `${Math.floor((now - new Date(d.lastAccessed)) / msPerDay)}d ago`,
+                      pct(d.size, stats.totalSize)
                     ])
                   ]);
                 
-                const potentialSavings = inactiveDevices.reduce((sum, [_, data]) => sum + data.size, 0);
-                const savingsGB = (potentialSavings / 1024 / 1024 / 1024).toFixed(2);
-                summary.addRaw(`\n> 💡 **Potential Savings**: Cleaning inactive devices could free up **${savingsGB} GB** (${((potentialSavings / totalCacheSize) * 100).toFixed(1)}% of total)\n\n`);
+                const potentialSavings = inactiveDevices.reduce((sum, d) => sum + d.size, 0);
+                const savingsGB = fmtGB(potentialSavings);
+                summary.addRaw(`\n> 💡 **Potential Savings**: Cleaning inactive devices could free up **${savingsGB} GB** (${pct(potentialSavings, stats.totalSize)} of total)\n\n`);
               }
             }
             
-            const oldestCaches = allCaches
-              .sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
-              .slice(0, 10);
-            
-            const newestCaches = allCaches
-              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-              .slice(0, 10);
-            
-            summary.addHeading('📅 Cache Age Information', 3)
-              .addRaw(`\n**Oldest Cache:** ${oldestCaches[0]?.key || 'N/A'} (${Math.floor((new Date() - new Date(oldestCaches[0]?.created_at)) / (1000 * 60 * 60 * 24))} days old)\n\n`)
-              .addRaw(`**Newest Cache:** ${newestCaches[0]?.key || 'N/A'} (${Math.floor((new Date() - new Date(newestCaches[0]?.created_at)) / (1000 * 60 * 60 * 24))} days old)\n\n`);
-            
+            // Recommendations
             summary.addHeading('💡 Recommendations', 3);
             
-            if (parseFloat(usagePercent) > 90) {
-              summary.addRaw(`\n⚠️ **Action Required**: Cache usage is critical (${usagePercent}%). Immediate cleanup recommended.\n\n`);
-            } else if (parseFloat(usagePercent) > 75) {
-              summary.addRaw(`\n⚠️ **Warning**: Cache usage is high (${usagePercent}%). Consider cleanup soon.\n\n`);
+            if (usagePercent > 90) {
+              summary.addRaw(`\n⚠️ **Action Required**: Cache usage is critical (${usagePercentStr}%). Immediate cleanup recommended.\n\n`);
+            } else if (usagePercent > 75) {
+              summary.addRaw(`\n⚠️ **Warning**: Cache usage is high (${usagePercentStr}%). Consider cleanup soon.\n\n`);
             } else {
-              summary.addRaw(`\n✅ **Healthy**: Cache usage is normal (${usagePercent}%). No immediate action needed.\n\n`);
+              summary.addRaw(`\n✅ **Healthy**: Cache usage is normal (${usagePercentStr}%). No immediate action needed.\n\n`);
             }
             
-            // ✅ UPDATED: Recommendations for v3 and legacy caches
-            if (cacheKeyVersions.v3 > 0) {
-              summary.addRaw(`- 🔄 **v3 Migration**: ${cacheKeyVersions.v3} v3 caches detected. Consider migrating to v4 format for consistency.\n`);
+            if (stats.cacheKeyVersions.v3 > 0) {
+              summary.addRaw(`- 🔄 **v3 Migration**: ${stats.cacheKeyVersions.v3} v3 caches detected. Consider migrating to v4 format.\n`);
             }
-            if (cacheKeyVersions.legacy > 0) {
-              summary.addRaw(`- 🔄 **Legacy Migration**: ${cacheKeyVersions.legacy} legacy caches detected. Run migration cleanup to adopt v4 format.\n`);
+            if (stats.cacheKeyVersions.legacy > 0) {
+              summary.addRaw(`- 🔄 **Legacy Migration**: ${stats.cacheKeyVersions.legacy} legacy caches detected. Run migration cleanup.\n`);
             }
-            
-            if (lastAccessDistribution.stale > 0) {
-              summary.addRaw(`- 🧹 **Stale Caches**: ${lastAccessDistribution.stale} caches haven't been accessed in 30+ days.\n`);
-            }
-            
-            // ===== FIX: Now inactiveDevices is accessible here =====
-            if (inactiveDevices.length > 0) {
-              summary.addRaw(`- 📱 **Inactive Devices**: ${inactiveDevices.length} devices haven't been built in 30+ days.\n`);
+            if (stats.activityDistribution.stale > 0) {
+              summary.addRaw(`- 🧹 **Stale Caches**: ${stats.activityDistribution.stale} caches haven't been accessed in 30+ days.\n`);
             }
             
             await summary.write();
             
-            core.setOutput('should_cleanup', usagePercent > 75 ? 'true' : 'false');
+            // Set outputs
             core.setOutput('total_size', totalSizeGB);
-            core.setOutput('cache_count', cacheCount);
-            core.setOutput('usage_percent', usagePercent);
-            core.setOutput('ccache_count', cachesByType.ccache.count);
-            core.setOutput('ccache_size', (cachesByType.ccache.size / 1024 / 1024 / 1024).toFixed(2));
+            core.setOutput('total_count', stats.totalCount);
+            core.setOutput('health_status', healthStatus);
+            core.setOutput('recommendation', recommendation);
+            core.setOutput('cache_data', JSON.stringify({
+              totalSize: stats.totalSize,
+              totalCount: stats.totalCount,
+              usagePercent: usagePercentStr,
+              maxSizeGB: MAX_SIZE_GB,
+              cachesByType: stats.cachesByType,
+              cacheKeyVersions: stats.cacheKeyVersions,
+              cachesByDevice: deviceArray,
+              ageDistribution: stats.ageDistribution,
+              activityDistribution: stats.activityDistribution,
+              oldestCache: stats.oldestCache,
+              newestCache: stats.newestCache,
+              healthStatus,
+              recommendation
+            }));
+            
+            console.log('Analysis complete');
+            console.log(`Total size: ${totalSizeGB} GB`);
+            console.log(`Usage: ${usagePercentStr}%`);
+            console.log(`Health: ${healthStatus}`);
 
   cleanup-caches:
+    name: 🧹 Cleanup Caches
     runs-on: ubuntu-latest
     needs: analyze
     if: |
@@ -502,9 +567,10 @@ jobs:
       inputs.cleanup_type == 'full_cleanup'
     
     steps:
-      - name: 🧹 Cleanup Caches
+      - name: 🗑️ Delete Matching Caches
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const { owner, repo } = context.repo;
             const dryRun = '${{ inputs.dry_run }}' === 'true';
@@ -512,6 +578,19 @@ jobs:
             const cachePattern = '${{ inputs.cache_pattern }}';
             const cacheAgeDays = parseInt('${{ inputs.cache_age_days }}');
             const forceCleanup = '${{ inputs.force_cleanup }}' === 'true';
+            
+            // ✅ UPDATED: Tolerant v3 regex
+            const V4_PATTERN = /^ccache-suki-v4-([^-]+)-([^-]+)-([^-]+)-([^-]+)-([^-]+)$/;
+            const V3_PATTERN = /^ccache-(?:suki-)?v3-([^-]+)-([0-9.]+)-(?:[A-Za-z0-9.-]+-)?(?:clang-[A-Za-z0-9.-]+-)?([A-Za-z0-9._-]+)(?:-.+)?$/;
+            
+            // ✅ NEW: Safe number formatting helpers
+            const toGB = bytes => bytes / 1024 / 1024 / 1024;
+            const fmtGB = (bytes, countHint = 0) => {
+              if (bytes === 0 && countHint > 0) return '0.00';
+              const g = toGB(bytes);
+              return g > 0 && g < 0.01 ? '<0.01' : g.toFixed(2);
+            };
+            const pct = (part, total) => total > 0 ? ((part / total) * 100).toFixed(1) + '%' : '0.0%';
             
             async function withRetry(fn, maxRetries = 3) {
               for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -554,7 +633,7 @@ jobs:
             const deletedDevices = new Set();
             
             const deletionStats = {
-              ccache: { count: 0, size: 0, v4: 0, v3: 0, legacy: 0, stable: 0 },
+              ccache: { count: 0, size: 0, v4: 0, v3: 0, legacy: 0 },
               apt: { count: 0, size: 0 },
               kernel: { count: 0, size: 0 },
               other: { count: 0, size: 0 }
@@ -564,51 +643,41 @@ jobs:
               const cacheKey = cache.key;
               const cacheDate = new Date(cache.created_at);
               const lastAccessDate = new Date(cache.last_accessed_at || cache.created_at);
-              const ageDays = Math.floor((new Date() - cacheDate) / (1000 * 60 * 60 * 24));
               const accessAgeDays = Math.floor((new Date() - lastAccessDate) / (1000 * 60 * 60 * 24));
               
-              // ✅ UPDATED: Support v4 format with 'suki' prefix
               const isV4Format = cacheKey.startsWith('ccache-suki-v4-');
-              const isV3Format = cacheKey.startsWith('ccache-suki-v3-');
-              const isStableKey = cacheKey.endsWith('-stable');
+              const isV3Format = cacheKey.startsWith('ccache-v3-') || cacheKey.startsWith('ccache-suki-v3-');
               
+              // Protection: Don't delete very recently used caches
               if (lastAccessDate > veryRecentCutoffDate && !forceCleanup) {
                 return { delete: false, reason: 'recently_used', accessAgeDays: Math.floor((new Date() - lastAccessDate) / (1000 * 60 * 60)) };
               }
               
               let device = null;
               let kernel = null;
-              let osVersion = null;
               
-              // ✅ UPDATED: Parse v4 format with 'suki' prefix
+              // ✅ UPDATED: Parse with tolerant v3 regex
               if (isV4Format) {
-                const v4Match = cacheKey.match(/^ccache-suki-v4-([^-]+)-([^-]+)-([^-]+)-([^-]+)-([^-]+)(?:-([^-]+))?$/);
+                const v4Match = cacheKey.match(V4_PATTERN);
                 if (v4Match) {
                   device = v4Match[1];        // OP13
-                  osVersion = v4Match[2];     // OOS15
-                  // androidVer = v4Match[3]; // android14
                   kernel = v4Match[4];        // 6.1
-                  // clangVer = v4Match[5];   // r510928
-                  // branch = v4Match[6];     // stable (optional)
                 }
               } else if (isV3Format) {
-                const v3Match = cacheKey.match(/^ccache-suki-v3-([^-]+-[\d.]+)-([A-Za-z0-9.-]+(?:-[A-Za-z0-9.-]+)*)-(clang-[A-Za-z0-9.-]+)-([A-Za-z0-9._-]+)(-stable)?$/);
+                const v3Match = cacheKey.match(V3_PATTERN);
                 if (v3Match) {
-                  kernel = v3Match[1];
-                  osVersion = v3Match[2];
-                  device = v3Match[4];
+                  // androidVer = v3Match[1]; // android14
+                  kernel = v3Match[2];        // 6.1
+                  device = v3Match[3];        // OP-ACE-5 or OP-ACE-3V
                 }
               } else if (cacheKey.startsWith('ccache-')) {
-                const kernelMatch = cacheKey.match(/^ccache-([^-]+-[\d.]+)-/);
-                if (kernelMatch) kernel = kernelMatch[1];
-                
+                // Legacy format
                 const legacy1 = cacheKey.match(/^ccache-[^-]+-[\d.]+-[^-]+-clang-[^-]+-([^-]+)$/);
                 const legacy2 = cacheKey.match(/^ccache-[^-]+-[\d.]+-[^-]+-([^-]+)$/);
-                const legacy3 = cacheKey.match(/ccache-[^-]+-[^-]+-[^-]+-[^-]+-([^-]+)/);
-                
-                device = legacy1?.[1] || legacy2?.[1] || legacy3?.[1] || null;
+                device = legacy1?.[1] || legacy2?.[1] || null;
               }
               
+              // Device filter matching
               const exactMatch =
                 deviceFilter === 'ALL' ||
                 (device && deviceFilter.toLowerCase() === device.toLowerCase()) ||
@@ -645,10 +714,6 @@ jobs:
                 
                 case 'ccache_stale':
                   if (cacheKey.startsWith('ccache-') && lastAccessDate < staleCutoffDate) {
-                    // ✅ UPDATED: Protect both v4 and v3 stable keys
-                    if ((isV4Format || isV3Format) && isStableKey && lastAccessDate >= veryStaleCutoffDate && !forceCleanup) {
-                      return { delete: false, reason: 'stable_recent' };
-                    }
                     patternMatch = true;
                     category = 'ccache';
                   }
@@ -685,7 +750,6 @@ jobs:
                 device: device,
                 isV4: isV4Format,
                 isV3: isV3Format,
-                isStable: isStableKey,
                 accessAgeDays: accessAgeDays
               };
             }
@@ -693,97 +757,85 @@ jobs:
             // Fetch and process caches
             console.log('🔍 Scanning caches...\n');
             
-            let page = 1;
-            while (true) {
-              const res = await withRetry(() =>
-                github.rest.actions.getActionsCacheList({
-                  owner,
-                  repo,
-                  per_page: 100,
-                  page: page
-                })
-              );
+            const caches = await github.paginate(
+              github.rest.actions.getActionsCacheList,
+              {
+                owner,
+                repo,
+                per_page: 100
+              }
+            );
+            
+            for (const cache of caches) {
+              const decision = shouldDeleteCache(cache);
+              const sizeMB = (cache.size_in_bytes / 1024 / 1024).toFixed(2);
+              const agedays = Math.floor((new Date() - new Date(cache.created_at)) / (1000 * 60 * 60 * 24));
               
-              const caches = res.data.actions_caches;
-              if (!caches || caches.length === 0) break;
-              
-              for (const cache of caches) {
-                const decision = shouldDeleteCache(cache);
-                const sizeMB = (cache.size_in_bytes / 1024 / 1024).toFixed(2);
-                const agedays = Math.floor((new Date() - new Date(cache.created_at)) / (1000 * 60 * 60 * 24));
+              if (decision.delete) {
+                deletedCaches.push({
+                  key: cache.key,
+                  size: sizeMB,
+                  sizeBytes: cache.size_in_bytes,
+                  age: agedays,
+                  created: cache.created_at,
+                  accessed: cache.last_accessed_at || cache.created_at,
+                  id: cache.id,
+                  category: decision.category,
+                  device: decision.device,
+                  accessAgeDays: decision.accessAgeDays
+                });
                 
-                if (decision.delete) {
-                  deletedCaches.push({
-                    key: cache.key,
-                    size: sizeMB,
-                    sizeBytes: cache.size_in_bytes,
-                    age: agedays,
-                    created: cache.created_at,
-                    accessed: cache.last_accessed_at || cache.created_at,
-                    id: cache.id,
-                    category: decision.category,
-                    device: decision.device,
-                    accessAgeDays: decision.accessAgeDays
-                  });
+                if (decision.device) {
+                  deletedDevices.add(decision.device);
+                }
+                
+                if (dryRun) {
+                  console.log(`🔍 Would delete: ${cache.key}`);
+                  console.log(`   Size: ${sizeMB} MB | Age: ${agedays} days | Type: ${decision.category}`);
+                } else {
+                  console.log(`🗑️ Deleting: ${cache.key}`);
+                  console.log(`   Size: ${sizeMB} MB | Age: ${agedays} days | Type: ${decision.category}`);
                   
-                  if (decision.device) {
-                    deletedDevices.add(decision.device);
-                  }
-                  
-                  if (dryRun) {
-                    console.log(`🔍 Would delete: ${cache.key}`);
-                    console.log(`   Size: ${sizeMB} MB | Age: ${agedays} days | Type: ${decision.category}`);
-                  } else {
-                    console.log(`🗑️ Deleting: ${cache.key}`);
-                    console.log(`   Size: ${sizeMB} MB | Age: ${agedays} days | Type: ${decision.category}`);
+                  try {
+                    await withRetry(() =>
+                      github.rest.actions.deleteActionsCacheById({
+                        owner,
+                        repo,
+                        cache_id: cache.id
+                      })
+                    );
+                    totalDeleted++;
+                    totalFreed += cache.size_in_bytes;
                     
-                    try {
-                      await withRetry(() =>
-                        github.rest.actions.deleteActionsCacheById({
-                          owner,
-                          repo,
-                          cache_id: cache.id
-                        })
-                      );
-                      totalDeleted++;
-                      totalFreed += cache.size_in_bytes;
-                      
-                      // Update category stats
-                      deletionStats[decision.category].count++;
-                      deletionStats[decision.category].size += cache.size_in_bytes;
-                      
-                      // Track format versions for ccache
-                      if (decision.category === 'ccache') {
-                        if (decision.isV4) deletionStats.ccache.v4++;
-                        else if (decision.isV3) deletionStats.ccache.v3++;
-                        else deletionStats.ccache.legacy++;
-                        
-                        if (decision.isStable) deletionStats.ccache.stable++;
-                      }
-                    } catch (error) {
-                      console.log(`   ⚠️ Failed: ${error.message}`);
-                      failedDeletions.push({
-                        key: cache.key,
-                        error: error.message
-                      });
+                    // Update category stats
+                    deletionStats[decision.category].count++;
+                    deletionStats[decision.category].size += cache.size_in_bytes;
+                    
+                    // Track format versions for ccache
+                    if (decision.category === 'ccache') {
+                      if (decision.isV4) deletionStats.ccache.v4++;
+                      else if (decision.isV3) deletionStats.ccache.v3++;
+                      else deletionStats.ccache.legacy++;
                     }
+                  } catch (error) {
+                    console.log(`   ⚠️ Failed: ${error.message}`);
+                    failedDeletions.push({
+                      key: cache.key,
+                      error: error.message
+                    });
                   }
-                } else if (decision.reason !== 'device_filter') {
-                  // Only log non-device-filter skips in verbose mode
-                  // console.log(`⏭️ Skipping: ${cache.key} (${decision.reason})`);
                 }
               }
-              
-              if (caches.length < 100) break;
-              page++;
             }
             
-            const freedGB = (totalFreed / 1024 / 1024 / 1024).toFixed(2);
+            // ✅ UPDATED: Use safe formatting
+            const freedGB = fmtGB(totalFreed, totalDeleted);
             
             console.log(`\n✅ Cleanup ${dryRun ? 'simulation' : 'complete'}:`);
             console.log(`   ${dryRun ? 'Would delete' : 'Deleted'}: ${totalDeleted} caches`);
             console.log(`   ${dryRun ? 'Would free' : 'Freed'}: ${freedGB} GB\n`);
             
+            // Generate summary
             const summary = core.summary
               .addHeading(`🧹 Cache Cleanup ${dryRun ? 'Preview' : 'Report'}`, 2)
               .addRaw(`\n**Cleanup Date:** ${new Date().toISOString()}\n\n`);
@@ -803,56 +855,43 @@ jobs:
                 ['Force Cleanup', forceCleanup ? 'Yes' : 'No']
               ]);
             
+            // ✅ UPDATED: Use safe formatting
             summary.addHeading('🗂️ Deletion Breakdown by Type', 3)
               .addTable([
                 [{data: 'Type', header: true}, {data: 'Count', header: true}, {data: 'Size (GB)', header: true}, {data: 'Percentage', header: true}],
                 ['ccache',
                  deletionStats.ccache.count.toString(),
-                 (deletionStats.ccache.size / 1024 / 1024 / 1024).toFixed(2),
-                 totalFreed > 0 ? `${((deletionStats.ccache.size / totalFreed) * 100).toFixed(1)}%` : '0%'],
+                 fmtGB(deletionStats.ccache.size, deletionStats.ccache.count),
+                 pct(deletionStats.ccache.size, totalFreed)],
                 ['apt packages',
                  deletionStats.apt.count.toString(),
-                 (deletionStats.apt.size / 1024 / 1024 / 1024).toFixed(2),
-                 totalFreed > 0 ? `${((deletionStats.apt.size / totalFreed) * 100).toFixed(1)}%` : '0%'],
+                 fmtGB(deletionStats.apt.size, deletionStats.apt.count),
+                 pct(deletionStats.apt.size, totalFreed)],
                 ['kernel sources',
                  deletionStats.kernel.count.toString(),
-                 (deletionStats.kernel.size / 1024 / 1024 / 1024).toFixed(2),
-                 totalFreed > 0 ? `${((deletionStats.kernel.size / totalFreed) * 100).toFixed(1)}%` : '0%'],
+                 fmtGB(deletionStats.kernel.size, deletionStats.kernel.count),
+                 pct(deletionStats.kernel.size, totalFreed)],
                 ['other',
                  deletionStats.other.count.toString(),
-                 (deletionStats.other.size / 1024 / 1024 / 1024).toFixed(2),
-                 totalFreed > 0 ? `${((deletionStats.other.size / totalFreed) * 100).toFixed(1)}%` : '0%']
+                 fmtGB(deletionStats.other.size, deletionStats.other.count),
+                 pct(deletionStats.other.size, totalFreed)]
               ]);
             
             if (deletionStats.ccache.count > 0) {
-              // ✅ UPDATED: Show v4, v3, and legacy breakdown
               summary.addHeading('🔑 ccache Format Breakdown', 3)
                 .addTable([
                   [{data: 'Format', header: true}, {data: 'Count', header: true}, {data: 'Percentage', header: true}],
                   ['v4 format', 
                    deletionStats.ccache.v4.toString(),
-                   `${((deletionStats.ccache.v4 / deletionStats.ccache.count) * 100).toFixed(1)}%`],
+                   pct(deletionStats.ccache.v4, deletionStats.ccache.count)],
                   ['v3 format', 
                    deletionStats.ccache.v3.toString(),
-                   `${((deletionStats.ccache.v3 / deletionStats.ccache.count) * 100).toFixed(1)}%`],
+                   pct(deletionStats.ccache.v3, deletionStats.ccache.count)],
                   ['Legacy format',
                    deletionStats.ccache.legacy.toString(),
-                   `${((deletionStats.ccache.legacy / deletionStats.ccache.count) * 100).toFixed(1)}%`],
-                  ['Stable keys',
-                   deletionStats.ccache.stable.toString(),
-                   `${((deletionStats.ccache.stable / deletionStats.ccache.count) * 100).toFixed(1)}%`]
+                   pct(deletionStats.ccache.legacy, deletionStats.ccache.count)]
                 ]);
             }
-            
-            // ✅ UPDATED: Protection rules for v4 and v3
-            summary.addRaw(`\n### 🛡️ Active Protection Rules\n\n`)
-              .addTable([
-                [{data: 'Protection', header: true}, {data: 'Threshold', header: true}, {data: 'Status', header: true}],
-                ['v4/v3 Stable Keys', '30 days since last access', forceCleanup ? '✅ Overridden' : '🔒 Active'],
-                ['Recently Used Caches', '2 hours since last access', forceCleanup ? '✅ Overridden' : '🔒 Active'],
-                ['Device Filter', deviceFilter, 'Active'],
-                ['Age Threshold', `${cacheAgeDays} days`, 'Active']
-              ]);
             
             if (deletedCaches.length > 0) {
               const largestDeleted = deletedCaches
@@ -870,50 +909,6 @@ jobs:
                     `${cache.accessAgeDays}d ago`
                   ])
                 ]);
-              
-              const stalestDeleted = deletedCaches
-                .sort((a, b) => new Date(a.accessed) - new Date(b.accessed))
-                .slice(0, 10);
-              
-              summary.addHeading('⏰ Top 10 Most Stale Caches (by last access)', 3)
-                .addTable([
-                  [{data: 'Cache Key', header: true}, {data: 'Last Access', header: true}, 
-                   {data: 'Size (MB)', header: true}, {data: 'Device', header: true}],
-                  ...stalestDeleted.map(cache => [
-                    cache.key,
-                    `${cache.accessAgeDays}d ago`,
-                    cache.size,
-                    cache.device || 'N/A'
-                  ])
-                ]);
-              
-              if (deletedDevices.size > 0) {
-                const deviceDeletions = new Map();
-                deletedCaches
-                  .filter(c => c.device && c.category === 'ccache')
-                  .forEach(c => {
-                    if (!deviceDeletions.has(c.device)) {
-                      deviceDeletions.set(c.device, { count: 0, size: 0 });
-                    }
-                    const stats = deviceDeletions.get(c.device);
-                    stats.count++;
-                    stats.size += c.sizeBytes;
-                  });
-                
-                const topDevices = Array.from(deviceDeletions.entries())
-                  .sort((a, b) => b[1].size - a[1].size)
-                  .slice(0, 10);
-                
-                summary.addHeading('📱 Top 10 Devices by Deleted ccache', 3)
-                  .addTable([
-                    [{data: 'Device', header: true}, {data: 'Caches Deleted', header: true}, {data: 'Size (GB)', header: true}],
-                    ...topDevices.map(([device, stats]) => [
-                      device,
-                      stats.count.toString(),
-                      (stats.size / 1024 / 1024 / 1024).toFixed(2)
-                    ])
-                  ]);
-              }
             }
             
             if (failedDeletions.length > 0) {
@@ -927,6 +922,7 @@ jobs:
             await summary.write();
 
   cleanup-runs:
+    name: 🗑️ Cleanup Workflow Runs
     runs-on: ubuntu-latest
     needs: analyze
     if: |
@@ -934,14 +930,18 @@ jobs:
       inputs.cleanup_type == 'full_cleanup'
     
     steps:
-      - name: 🗑️ Cleanup Old Workflow Runs
+      - name: 🧹 Delete Old Runs
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const { owner, repo } = context.repo;
             const dryRun = '${{ inputs.dry_run }}' === 'true';
             const keepDays = 30;
             const keepRecent = 5;
+            
+            // ✅ NEW: Safe percentage helper
+            const pct = (part, total) => total > 0 ? ((part / total) * 100).toFixed(1) + '%' : '0.0%';
             
             async function withRetry(fn, maxRetries = 3) {
               for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -993,77 +993,69 @@ jobs:
               console.log(`\n📋 Processing workflow: ${workflow.name}`);
               
               const successfulRuns = [];
-              let page = 1;
               
-              while (true) {
-                const runs = await withRetry(() =>
-                  github.rest.actions.listWorkflowRuns({
-                    owner,
-                    repo,
-                    workflow_id: workflow.id,
-                    per_page: 100,
-                    page: page
-                  })
-                );
+              const runs = await github.paginate(
+                github.rest.actions.listWorkflowRuns,
+                {
+                  owner,
+                  repo,
+                  workflow_id: workflow.id,
+                  per_page: 100
+                }
+              );
+              
+              for (const run of runs) {
+                const runDate = new Date(run.created_at);
+                const isOld = runDate < cutoffDate;
                 
-                if (!runs.data.workflow_runs || runs.data.workflow_runs.length === 0) break;
+                const isFailed = run.conclusion === 'failure';
+                const isCancelled = run.conclusion === 'cancelled';
+                const isSkipped = run.conclusion === 'skipped';
                 
-                for (const run of runs.data.workflow_runs) {
-                  const runDate = new Date(run.created_at);
-                  const isOld = runDate < cutoffDate;
-                  
-                  const isFailed = run.conclusion === 'failure';
-                  const isCancelled = run.conclusion === 'cancelled';
-                  const isSkipped = run.conclusion === 'skipped';
-                  
-                  if (run.conclusion === 'success') {
-                    successfulRuns.push(run);
-                  }
-                  
-                  const tooManySuccessful = run.conclusion === 'success' && 
-                                           runDate < cutoffDate &&
-                                           successfulRuns.length > keepRecent;
-                  
-                  const shouldDelete = 
-                    (isFailed && isOld) ||
-                    (isCancelled && isOld) ||
-                    (isSkipped && isOld) ||
-                    tooManySuccessful;
-                  
-                  if (shouldDelete) {
-                    console.log(`${dryRun ? '[DRY RUN] Would delete' : 'Deleting'}: Run #${run.run_number} (${run.conclusion}, ${Math.floor((new Date() - runDate) / (1000 * 60 * 60 * 24))}d old)`);
-                    
-                    if (!dryRun) {
-                      try {
-                        await withRetry(() =>
-                          github.rest.actions.deleteWorkflowRun({
-                            owner,
-                            repo,
-                            run_id: run.id
-                          })
-                        );
-                      } catch (error) {
-                        console.error(`❌ Failed to delete run #${run.run_number}: ${error.message}`);
-                        continue;
-                      }
-                    }
-                    
-                    totalDeleted++;
-                    
-                    if (!deletionsByWorkflow.has(workflow.name)) {
-                      deletionsByWorkflow.set(workflow.name, 0);
-                    }
-                    deletionsByWorkflow.set(workflow.name, deletionsByWorkflow.get(workflow.name) + 1);
-                    
-                    if (isFailed) deletionsByStatus.failed++;
-                    else if (isCancelled) deletionsByStatus.cancelled++;
-                    else if (isSkipped) deletionsByStatus.skipped++;
-                    else if (run.conclusion === 'success') deletionsByStatus.success++;
-                  }
+                if (run.conclusion === 'success') {
+                  successfulRuns.push(run);
                 }
                 
-                if (runs.data.workflow_runs.length < 100) break;
-                page++;
+                const tooManySuccessful = run.conclusion === 'success' && 
+                                         isOld &&
+                                         successfulRuns.length > keepRecent;
+                
+                const shouldDelete = 
+                  (isFailed && isOld) ||
+                  (isCancelled && isOld) ||
+                  (isSkipped && isOld) ||
+                  tooManySuccessful;
+                
+                if (shouldDelete) {
+                  console.log(`${dryRun ? '[DRY RUN] Would delete' : 'Deleting'}: Run #${run.run_number} (${run.conclusion}, ${Math.floor((new Date() - runDate) / (1000 * 60 * 60 * 24))}d old)`);
+                  
+                  if (!dryRun) {
+                    try {
+                      await withRetry(() =>
+                        github.rest.actions.deleteWorkflowRun({
+                          owner,
+                          repo,
+                          run_id: run.id
+                        })
+                      );
+                    } catch (error) {
+                      console.error(`❌ Failed to delete run #${run.run_number}: ${error.message}`);
+                      continue;
+                    }
+                  }
+                  
+                  totalDeleted++;
+                  
+                  if (!deletionsByWorkflow.has(workflow.name)) {
+                    deletionsByWorkflow.set(workflow.name, 0);
+                  }
+                  deletionsByWorkflow.set(workflow.name, deletionsByWorkflow.get(workflow.name) + 1);
+                  
+                  if (isFailed) deletionsByStatus.failed++;
+                  else if (isCancelled) deletionsByStatus.cancelled++;
+                  else if (isSkipped) deletionsByStatus.skipped++;
+                  else if (run.conclusion === 'success') deletionsByStatus.success++;
+                }
               }
             }
             
@@ -1086,13 +1078,14 @@ jobs:
                 ['Keep Recent Successful', `${keepRecent} per workflow`]
               ]);
             
+            // ✅ UPDATED: Use safe percentage helper
             summary.addHeading('📈 Deletions by Status', 3)
               .addTable([
                 [{data: 'Status', header: true}, {data: 'Count', header: true}, {data: 'Percentage', header: true}],
-                ['Failed', deletionsByStatus.failed.toString(), totalDeleted > 0 ? `${((deletionsByStatus.failed / totalDeleted) * 100).toFixed(1)}%` : '0%'],
-                ['Cancelled', deletionsByStatus.cancelled.toString(), totalDeleted > 0 ? `${((deletionsByStatus.cancelled / totalDeleted) * 100).toFixed(1)}%` : '0%'],
-                ['Skipped', deletionsByStatus.skipped.toString(), totalDeleted > 0 ? `${((deletionsByStatus.skipped / totalDeleted) * 100).toFixed(1)}%` : '0%'],
-                ['Success (old)', deletionsByStatus.success.toString(), totalDeleted > 0 ? `${((deletionsByStatus.success / totalDeleted) * 100).toFixed(1)}%` : '0%']
+                ['Failed', deletionsByStatus.failed.toString(), pct(deletionsByStatus.failed, totalDeleted)],
+                ['Cancelled', deletionsByStatus.cancelled.toString(), pct(deletionsByStatus.cancelled, totalDeleted)],
+                ['Skipped', deletionsByStatus.skipped.toString(), pct(deletionsByStatus.skipped, totalDeleted)],
+                ['Success (old)', deletionsByStatus.success.toString(), pct(deletionsByStatus.success, totalDeleted)]
               ]);
             
             if (deletionsByWorkflow.size > 0) {
@@ -1110,19 +1103,33 @@ jobs:
             await summary.write();
 
   final-report:
+    name: 📊 Final Report
+    runs-on: ubuntu-latest
+    needs: [analyze, cleanup-caches, cleanup-runs]
+    if: always()
     
-      runs-on: ubuntu-latest
-      needs: [analyze, cleanup-caches, cleanup-runs]
-      if: always()
-    
-      steps:
-      - name: 📊 Generate Final Report
+    steps:
+      - name: 📈 Generate Summary
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const { owner, repo } = context.repo;
             const dryRun = '${{ inputs.dry_run }}' === 'true';
             const cleanupType = '${{ inputs.cleanup_type }}';
+            
+            // ✅ UPDATED: Tolerant v3 regex
+            const V4_PATTERN = /^ccache-suki-v4-([^-]+)-([^-]+)-([^-]+)-([^-]+)-([^-]+)$/;
+            const V3_PATTERN = /^ccache-(?:suki-)?v3-([^-]+)-([0-9.]+)-(?:[A-Za-z0-9.-]+-)?(?:clang-[A-Za-z0-9.-]+-)?([A-Za-z0-9._-]+)(?:-.+)?$/;
+            
+            // ✅ NEW: Safe number formatting helpers
+            const toGB = bytes => bytes / 1024 / 1024 / 1024;
+            const fmtGB = (bytes, countHint = 0) => {
+              if (bytes === 0 && countHint > 0) return '0.00';
+              const g = toGB(bytes);
+              return g > 0 && g < 0.01 ? '<0.01' : g.toFixed(2);
+            };
+            const pct = (part, total) => total > 0 ? ((part / total) * 100).toFixed(1) + '%' : '0.0%';
             
             async function withRetry(fn, maxRetries = 3) {
               for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -1148,88 +1155,81 @@ jobs:
             
             console.log('📊 Generating final report...\n');
             
-            const beforeSize = Number('${{ needs.analyze.outputs.total_cache_size || 0 }}') || 0;
-            const beforeCount = Number('${{ needs.analyze.outputs.cache_count || 0 }}') || 0;
-            const beforePercent = Number('${{ needs.analyze.outputs.usage_percent || 0 }}') || 0;
+            // ✅ UPDATED: Parse beforeSize as number (it's already in GB from analyze job)
+            const beforeSize = parseFloat('${{ needs.analyze.outputs.total_size }}') || 0;
+            const beforeCount = parseInt('${{ needs.analyze.outputs.total_count }}') || 0;
             
             let totalCacheSize = 0;
             let cacheCount = 0;
             const buildFrequency = new Map();
             const recentCutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
             
-            let page = 1;
-            while (true) {
-              const res = await withRetry(() =>
-                github.rest.actions.getActionsCacheList({
-                  owner,
-                  repo,
-                  per_page: 100,
-                  page: page
-                })
-              );
+            const caches = await github.paginate(
+              github.rest.actions.getActionsCacheList,
+              {
+                owner,
+                repo,
+                per_page: 100
+              }
+            );
+            
+            for (const cache of caches) {
+              totalCacheSize += cache.size_in_bytes;
+              cacheCount++;
               
-              const caches = res.data.actions_caches;
-              if (!caches || caches.length === 0) break;
-              
-              for (const cache of caches) {
-                totalCacheSize += cache.size_in_bytes;
-                cacheCount++;
+              if (cache.key.startsWith('ccache-')) {
+                const isV4Format = cache.key.startsWith('ccache-suki-v4-');
+                const isV3Format = cache.key.startsWith('ccache-v3-') || cache.key.startsWith('ccache-suki-v3-');
                 
-                if (cache.key.startsWith('ccache-')) {
-                  // ✅ FIXED: Support v4 format with 'suki' prefix in final report
-                  const isV4Format = cache.key.startsWith('ccache-suki-v4-');
-                  const isV3Format = cache.key.startsWith('ccache-suki-v3-');
-                  
-                  let device = null;
-                  
-                  // Parse device from cache key
-                  if (isV4Format) {
-                    const v4Match = cache.key.match(/^ccache-suki-v4-([^-]+)-([^-]+)-([^-]+)-([^-]+)-([^-]+)(?:-([^-]+))?$/);
-                    if (v4Match) {
-                      device = v4Match[1]; // OP13
-                    }
-                  } else if (isV3Format) {
-                    const v3Match = cache.key.match(/^ccache-suki-v3-([^-]+-[\d.]+)-([A-Za-z0-9.-]+(?:-[A-Za-z0-9.-]+)*)-(clang-[A-Za-z0-9.-]+)-([A-Za-z0-9._-]+)(-stable)?$/);
-                    if (v3Match) {
-                      device = v3Match[4];
-                    }
-                  } else {
-                    // Legacy format
-                    const legacy1 = cache.key.match(/^ccache-[^-]+-[\d.]+-[^-]+-clang-[^-]+-([^-]+)$/);
-                    const legacy2 = cache.key.match(/^ccache-[^-]+-[\d.]+-[^-]+-([^-]+)$/);
-                    device = legacy1?.[1] || legacy2?.[1] || null;
+                let device = null;
+                
+                // ✅ UPDATED: Parse device from cache key with tolerant v3 regex
+                if (isV4Format) {
+                  const v4Match = cache.key.match(V4_PATTERN);
+                  if (v4Match) {
+                    device = v4Match[1]; // OP13
                   }
-                  
-                  if (device) {
-                    const lastAccessDate = new Date(cache.last_accessed_at || cache.created_at);
-                    if (lastAccessDate >= recentCutoff) {
-                      if (!buildFrequency.has(device)) {
-                        buildFrequency.set(device, 0);
-                      }
-                      buildFrequency.set(device, buildFrequency.get(device) + 1);
+                } else if (isV3Format) {
+                  const v3Match = cache.key.match(V3_PATTERN);
+                  if (v3Match) {
+                    device = v3Match[3]; // OP-ACE-5 or OP-ACE-3V
+                  }
+                } else {
+                  // Legacy format
+                  const legacy1 = cache.key.match(/^ccache-[^-]+-[\d.]+-[^-]+-clang-[^-]+-([^-]+)$/);
+                  const legacy2 = cache.key.match(/^ccache-[^-]+-[\d.]+-[^-]+-([^-]+)$/);
+                  device = legacy1?.[1] || legacy2?.[1] || null;
+                }
+                
+                if (device) {
+                  const lastAccessDate = new Date(cache.last_accessed_at || cache.created_at);
+                  if (lastAccessDate >= recentCutoff) {
+                    if (!buildFrequency.has(device)) {
+                      buildFrequency.set(device, 0);
                     }
+                    buildFrequency.set(device, buildFrequency.get(device) + 1);
                   }
                 }
               }
-              
-              if (caches.length < 100) break;
-              page++;
             }
             
-            const afterSizeGB = (totalCacheSize / 1024 / 1024 / 1024).toFixed(2);
+            // ✅ UPDATED: Safe calculations
+            const afterSizeGBNum = toGB(totalCacheSize);
+            const afterSizeGB = fmtGB(totalCacheSize, cacheCount);
             const maxCacheSize = 10 * 1024 * 1024 * 1024;
-            const afterPercent = ((totalCacheSize / maxCacheSize) * 100).toFixed(1);
+            const afterPercentNum = totalCacheSize > 0 ? (totalCacheSize / maxCacheSize) * 100 : 0;
+            const afterPercent = afterPercentNum.toFixed(1);
             
-            const freedSpace = beforeSize - parseFloat(afterSizeGB);
+            const freedSpace = beforeSize - afterSizeGBNum;
             const freedCaches = beforeCount - cacheCount;
-            const percentReduction = beforeSize > 0 ? ((freedSpace / beforeSize) * 100).toFixed(1) : 0;
+            const beforeUsage = beforeSize > 0 ? ((beforeSize / 10) * 100).toFixed(1) : '0.0';
             
             let healthEmoji = '🟢';
             let healthStatus = 'Healthy';
-            if (parseFloat(afterPercent) > 90) {
+            if (afterPercentNum > 90) {
               healthEmoji = '🔴';
               healthStatus = 'Critical';
-            } else if (parseFloat(afterPercent) > 75) {
+            } else if (afterPercentNum > 75) {
               healthEmoji = '🟡';
               healthStatus = 'Warning';
             }
@@ -1242,13 +1242,26 @@ jobs:
               summary.addRaw(`> ⚠️ **DRY RUN MODE** - This is a simulation. No actual changes were made.\n\n`);
             }
             
+            // ✅ UPDATED: Use safe formatting and calculations
             summary.addHeading('📊 Before vs After', 3)
               .addTable([
                 [{data: 'Metric', header: true}, {data: 'Before', header: true}, {data: 'After', header: true}, {data: 'Change', header: true}],
-                ['Cache Size', `${beforeSize} GB`, `${afterSizeGB} GB`, dryRun ? `Would free ${freedSpace.toFixed(2)} GB` : `Freed ${freedSpace.toFixed(2)} GB`],
-                ['Cache Count', beforeCount.toString(), cacheCount.toString(), dryRun ? `Would delete ${freedCaches}` : `Deleted ${freedCaches}`],
-                ['Usage %', `${beforePercent}%`, `${afterPercent}%`, `${(beforePercent - parseFloat(afterPercent)).toFixed(1)}% reduction`],
-                ['Health', '', healthStatus, healthEmoji]
+                ['Cache Size', 
+                 `${beforeSize.toFixed(2)} GB`, 
+                 `${afterSizeGB} GB`, 
+                 dryRun ? `Would free ${freedSpace.toFixed(2)} GB` : `Freed ${freedSpace.toFixed(2)} GB`],
+                ['Cache Count', 
+                 beforeCount.toString(), 
+                 cacheCount.toString(), 
+                 dryRun ? `Would delete ${freedCaches}` : `Deleted ${freedCaches}`],
+                ['Usage %', 
+                 `${beforeUsage}%`, 
+                 `${afterPercent}%`, 
+                 `${(parseFloat(beforeUsage) - parseFloat(afterPercent)).toFixed(1)}% reduction`],
+                ['Health', 
+                 '', 
+                 healthStatus, 
+                 healthEmoji]
               ]);
             
             if (cleanupType !== 'analyze_only') {
@@ -1274,9 +1287,9 @@ jobs:
             
             summary.addHeading('💡 Recommendations', 3);
             
-            if (parseFloat(afterPercent) > 90) {
+            if (afterPercentNum > 90) {
               summary.addRaw(`\n⚠️ **Critical**: Cache usage is still very high (${afterPercent}%). Consider more aggressive cleanup.\n\n`);
-            } else if (parseFloat(afterPercent) > 75) {
+            } else if (afterPercentNum > 75) {
               summary.addRaw(`\n⚠️ **Warning**: Cache usage is elevated (${afterPercent}%). Monitor closely.\n\n`);
             } else {
               summary.addRaw(`\n✅ **Healthy**: Cache usage is at a good level (${afterPercent}%).\n\n`);
@@ -1288,4 +1301,4 @@ jobs:
             
             await summary.write();
             
-            console.log('\n✅ Final report generated successfully');
+            console.log('\n✅ Final report generated successfully'); 
