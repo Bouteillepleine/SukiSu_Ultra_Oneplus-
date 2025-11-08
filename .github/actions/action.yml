@@ -94,8 +94,8 @@ runs:
         echo "Parsed config:"
         jq '.' /tmp/config.json
         echo ""
-        echo "📱 Device: ${OP_MODEL:-unknown}"
-        echo "🔧 OS Version: $OP_OS_VERSION (for reference only)"
+        echo "📱 Device: $(jq -r '.model // "unknown"' /tmp/config.json)"
+        echo "🔧 OS Version: $(jq -r '.os_version // "unknown"' /tmp/config.json) (for reference only)"
         echo "::endgroup::"
 
     - name: Validate Inputs
@@ -104,17 +104,32 @@ runs:
         set -euo pipefail
         echo "::group::Validate inputs"
         
+        # Read and sanitize inputs (remove quotes)
         model="${OP_MODEL:-}"
+        model="${model//\"/}"
+        model="${model//\'/}"
+        
         soc="${OP_SOC:-}"
+        soc="${soc//\"/}"
+        soc="${soc//\'/}"
+        
         branch="${OP_BRANCH:-}"
+        branch="${branch//\"/}"
+        branch="${branch//\'/}"
+        
         manifest="${OP_MANIFEST:-}"
+        manifest="${manifest//\"/}"
+        manifest="${manifest//\'/}"
+        
         optimize='${{ inputs.optimize_level }}'
-
+    
+        # Validate required fields
         [[ -n "$model" ]] || { echo "::error::Input 'model' cannot be empty or was not parsed from op_config_json"; exit 1; }
         [[ -n "$soc" ]] || { echo "::error::Input 'soc' cannot be empty"; exit 1; }
         [[ -n "$branch" ]] || { echo "::error::Input 'branch' cannot be empty"; exit 1; }
         [[ -n "$manifest" ]] || { echo "::error::Input 'manifest' cannot be empty"; exit 1; }
-
+    
+        # Validate formats
         if ! [[ "$soc" =~ ^[A-Za-z0-9_-]+$ ]]; then
           echo "::error::Input 'soc' contains invalid characters: $soc"
           exit 1
@@ -125,6 +140,7 @@ runs:
           exit 1
         fi
         
+        # Validate manifest
         if [[ "$manifest" == http*://* ]]; then
           if ! [[ "$manifest" =~ ^https:// ]]; then
             echo "::error::Manifest URL must be HTTPS, got: $manifest"
@@ -145,6 +161,7 @@ runs:
           fi
         fi
         
+        # Validate optimization level
         case "$optimize" in
           O2|O3) ;;
           *) 
@@ -153,6 +170,9 @@ runs:
             ;;
         esac
         
+        # ✅ Set CONFIG immediately after validation passes
+        echo "CONFIG=$model" >> "$GITHUB_ENV"
+        
         echo "✅ Input validation passed"
         echo "  Model: $model"
         echo "  SoC: $soc"
@@ -160,17 +180,7 @@ runs:
         echo "  Manifest: ${manifest:0:80}..."
         echo "  Optimization: $optimize"
         echo "::endgroup::"
-
-    - name: 📦 Cache APT Build Dependencies
-      uses: actions/cache@v4
-      with:
-        path: |
-          /var/cache/apt/archives
-          /var/lib/apt/lists
-        key: apt-kernel-build-${{ runner.os }}-v1
-        restore-keys: |
-          apt-kernel-build-${{ runner.os }}-
-  
+   
     - name: Install Minimal Dependencies
       shell: bash
       run: |
@@ -515,9 +525,8 @@ runs:
         echo "::group::Detect Clang"
         KP="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
         
-        # Initialize to satisfy set -u during this step
+        # Initialize to satisfy set -u
         CLANG_BIN_PATH=""
-        export CLANG_BIN_PATH
         
         CLANG_FOUND=false
         CLANG_BIN=""
@@ -542,7 +551,9 @@ runs:
         
         CLANG_BIN_PATH="$CLANG_BIN"
         echo "CLANG_BIN_PATH=$CLANG_BIN_PATH" >> "$GITHUB_ENV"
-        echo "PATH=${CLANG_BIN_PATH}:$PATH" >> "$GITHUB_ENV"
+        
+        # ✅ Deferred PATH expansion (prevents duplication)
+        echo "PATH=${CLANG_BIN_PATH}:\$PATH" >> "$GITHUB_ENV"
         
         CLANG_VERSION="$("$CLANG_BIN_PATH/clang" --version | head -n1)"
         echo "CLANG_VERSION=$CLANG_VERSION" >> "$GITHUB_ENV"
@@ -555,30 +566,38 @@ runs:
         set -euo pipefail
         echo "::group::Normalize clang version"
         
-        if [ -n "${CLANG_BIN_PATH:-}" ]; then          
+        CLANG_VERSION_SHORT=""
+        
+        # ✅ Primary: Extract from CLANG_BIN_PATH
+        if [ -n "${CLANG_BIN_PATH:-}" ]; then
           toolchain_dir="$(dirname "${CLANG_BIN_PATH}")"
           
-          # Expect .../clang-rXXXXX[letter]
+          # Match pattern: .../clang-rXXXXX[letter]
           if echo "$toolchain_dir" | grep -qE '/clang-r[0-9]+[a-z]*$'; then
             detected_short="$(basename "$toolchain_dir" | sed 's/^clang-//')"
-            
-            if [ "$detected_short" != "${CLANG_VERSION_SHORT:-}" ]; then
-              echo "⚠️ CLANG_VERSION_SHORT mismatch:"
-              echo "   Environment: '${CLANG_VERSION_SHORT:-unset}'"
-              echo "   Detected: '$detected_short'"
-              echo "   → Using detected version"
-              echo "CLANG_VERSION_SHORT=$detected_short" >> "$GITHUB_ENV"
-            else
-              echo "✅ CLANG_VERSION_SHORT matches detected: $detected_short"
-            fi
+            CLANG_VERSION_SHORT="$detected_short"
+            echo "✅ Extracted from path: $CLANG_VERSION_SHORT"
           else
-            echo "ℹ️ Toolchain path doesn't match expected pattern, keeping env value"
+            # ✅ Fallback: Broader pattern search in path
+            if detected_short="$(echo "$CLANG_BIN_PATH" | grep -oE 'clang-r[0-9]+[a-z]*' | tail -1)"; then
+              CLANG_VERSION_SHORT="${detected_short#clang-}"
+              echo "✅ Extracted from path (broad): $CLANG_VERSION_SHORT"
+            else
+              echo "ℹ️ Toolchain path doesn't match expected pattern"
+            fi
           fi
         else
-          echo "⚠️ CLANG_BIN_PATH not set, cannot validate"
+          echo "⚠️ CLANG_BIN_PATH not set, cannot extract version"
         fi
         
-        echo "Final CLANG_VERSION_SHORT: ${CLANG_VERSION_SHORT:-unknown}"
+        # ✅ Always export final value
+        if [ -n "$CLANG_VERSION_SHORT" ]; then
+          echo "CLANG_VERSION_SHORT=$CLANG_VERSION_SHORT" >> "$GITHUB_ENV"
+          echo "Final CLANG_VERSION_SHORT: $CLANG_VERSION_SHORT"
+        else
+          echo "::warning::CLANG_VERSION_SHORT could not be determined"
+        fi
+        
         echo "::endgroup::"
 
     - name: Set Cache Strategy
@@ -587,30 +606,25 @@ runs:
         set -euo pipefail
         echo "::group::Configure cache strategy"
         
-        # ============================================
-        # CRITICAL: Initialize all variables first
-        # ============================================
+        # Initialize all variables
         CLANG_VERSION_SHORT="${CLANG_VERSION_SHORT:-}"
         ANDROID_VER="${ANDROID_VER:-}"
         KERNEL_VER="${KERNEL_VER:-}"
         
-        # ============================================
         # Extract clang version from build.config (ROBUST)
-        # ============================================
         BUILD_CONFIG="${GITHUB_WORKSPACE}/${{ env.CONFIG }}/kernel_platform/common/build.config.constants"
         
         if [ -f "$BUILD_CONFIG" ]; then
           echo "Reading clang version from build.config..."
           
-          # ✅ Robust awk extraction: handles quotes, whitespace, and prefix
+          # ✅ Improved awk: strips quotes and whitespace
           CLANG_FROM_CONFIG="$(awk -F= '
             /^CLANG_VERSION=/ {
               val = $2
               # Strip leading/trailing whitespace
               gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
               # Strip surrounding quotes (single or double)
-              gsub(/^"|"$/, "", val)
-              gsub(/^'\''|'\''$/, "", val)
+              gsub(/^["'\'']|["'\'']$/, "", val)
               # Remove clang- prefix if present
               gsub(/^clang-/, "", val)
               print val
@@ -634,24 +648,7 @@ runs:
           echo "  ⚠️  build.config.constants not found at: $BUILD_CONFIG"
         fi
         
-        # ============================================
-        # Fallback: Extract from CLANG_BIN_PATH
-        # ============================================
-        if [ -z "$CLANG_VERSION_SHORT" ] && [ -n "${CLANG_BIN_PATH:-}" ]; then
-          echo "Attempting to extract from CLANG_BIN_PATH..."
-          
-          toolchain_dir="$(dirname "${CLANG_BIN_PATH}")"
-          
-          if echo "$toolchain_dir" | grep -qE '/clang-r[0-9]+[a-z]*$'; then
-            detected_short="$(basename "$toolchain_dir" | sed 's/^clang-//')"
-            CLANG_VERSION_SHORT="$detected_short"
-            echo "  Extracted from path: $CLANG_VERSION_SHORT"
-          fi
-        fi
-        
-        # ============================================
-        # ✅ NEW: Validate format before normalization
-        # ============================================
+        # Validate format before normalization
         if [ -n "$CLANG_VERSION_SHORT" ]; then
           if ! [[ "$CLANG_VERSION_SHORT" =~ ^r[0-9]+[a-z]*$ ]]; then
             echo "  ⚠️  Invalid CLANG_VERSION_SHORT format: '$CLANG_VERSION_SHORT'"
@@ -661,17 +658,13 @@ runs:
           fi
         fi
         
-        # ============================================
-        # Final fallback: Use default
-        # ============================================
+        # Final fallback
         if [ -z "$CLANG_VERSION_SHORT" ]; then
           CLANG_VERSION_SHORT="r487747c"
           echo "  ⚠️  Using default fallback: $CLANG_VERSION_SHORT"
         fi
         
-        # ============================================
-        # ✅ Normalize to reduce key fragmentation
-        # ============================================
+        # Normalize to reduce key fragmentation
         echo ""
         echo "🔧 Normalizing clang version for cache deduplication..."
         ORIGINAL_VERSION="$CLANG_VERSION_SHORT"
@@ -698,19 +691,15 @@ runs:
             ;;
         esac
         
-        # ============================================
         # Export to environment
-        # ============================================
         echo "CLANG_VERSION_SHORT=$CLANG_VERSION_SHORT" >> "$GITHUB_ENV"
         
-        # ============================================
-        # Configure ccache (larger size for better hits)
-        # ============================================
+        # ✅ Configure ccache with consistent compression level
         echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
         echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}" >> "$GITHUB_ENV"
         echo "CCACHE_MAXSIZE=5G" >> "$GITHUB_ENV"
         echo "CCACHE_COMPRESS=true" >> "$GITHUB_ENV"
-        echo "CCACHE_COMPRESSLEVEL=6" >> "$GITHUB_ENV"
+        echo "CCACHE_COMPRESSLEVEL=3" >> "$GITHUB_ENV"
         
         echo ""
         echo "📦 Cache configuration:"
@@ -724,16 +713,11 @@ runs:
         echo "  CCACHE settings:"
         echo "    Directory: $HOME/.ccache"
         echo "    Base dir: ${GITHUB_WORKSPACE}"
-        echo "    Max size: 5G (increased for better hit rates)"
-        echo "    Compression: enabled (level 6)"
+        echo "    Max size: 5G"
+        echo "    Compression: zstd level 3"
         echo ""
         echo "💡 Cache sharing scope:"
         echo "  All devices using clang-${CLANG_VERSION_SHORT}* will share this toolchain cache"
-        echo "  Expected benefit: Reduced cache entries, better hit rates, faster cold starts"
-        echo ""
-        echo "🎯 Cache strategy:"
-        echo "  Toolchain: Restore-only (shared, immutable)"
-        echo "  ccache: Save always (device-specific, incremental)"
         echo "::endgroup::"
 
     - name: Ensure ccache is available
@@ -921,13 +905,15 @@ runs:
           echo "ℹ️ ccache is empty; first build may be slower"
         fi
         
-        ccache -M "${CCACHE_MAXSIZE:-3G}"
+        ccache -M "${CCACHE_MAXSIZE:-5G}"
         ccache -o compression=true
-        ccache -o compression_level=1
+        ccache -o compression_level="${CCACHE_COMPRESSLEVEL:-3}"
         ccache -o depend_mode=true || true
         ccache -o base_dir="${CCACHE_BASEDIR:-$GITHUB_WORKSPACE}"
         ccache -o hash_dir=false
         ccache -o direct_mode=true
+        ccache -o file_clone=true || true
+        ccache -o hard_link=true || true
         ccache -o sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime,pch_defines,system_headers,locale
         
         if [ "${{ inputs.clean }}" = "true" ]; then
@@ -1818,29 +1804,7 @@ runs:
         echo "📊 ccache: ${HIT_RATE}% hit rate (${DIRECT_RATE}% direct)"
         ccache -s
         echo "::endgroup::"
-
-    - name: 📊 Cache Status
-      if: ${{ inputs.clean != 'true' }}
-      shell: bash
-      run: |
-        echo "::group::Cache restore status"
         
-        CACHE_KEY="ccache-suki-v4-${{ runner.os }}-${ANDROID_VER}-${KERNEL_VER}-${CLANG_VERSION_SHORT}"
-        
-        if [ "${{ steps.cache_restore.outputs.cache-hit }}" = "true" ]; then
-          echo "✅ Cache hit: Exact match found"
-          echo "   Key: $CACHE_KEY"
-        elif [ -n "${{ steps.cache_restore.outputs.cache-matched-key }}" ]; then
-          echo "⚡ Cache restored from partial match"
-          echo "   Target: $CACHE_KEY"
-          echo "   Matched: ${{ steps.cache_restore.outputs.cache-matched-key }}"
-        else
-          echo "❄️ Cache miss: Building from scratch"
-          echo "   Key: $CACHE_KEY"
-        fi
-        
-        echo "::endgroup::"
-    
     - name: 💾 Check Disk Space (Post-Build)
       if: always()
       shell: bash
@@ -1871,8 +1835,7 @@ runs:
           CCACHE_SIZE=$(du -sh "$HOME/.ccache" 2>/dev/null | cut -f1)
           echo "- **ccache:** $CCACHE_SIZE" >> $GITHUB_STEP_SUMMARY
         fi
-        
-        # ✅ FIXED: Check if CONFIG is set
+                      
         if [ -n "${CONFIG:-}" ] && [ -d "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/prebuilts" ]; then
           PREBUILTS_SIZE=$(du -sh "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/prebuilts" 2>/dev/null | cut -f1)
           echo "- **Toolchain:** $PREBUILTS_SIZE" >> $GITHUB_STEP_SUMMARY
@@ -1883,15 +1846,24 @@ runs:
           echo "- **Build output:** $OUT_SIZE" >> $GITHUB_STEP_SUMMARY
         fi
         
-        echo "" >> $GITHUB_STEP_SUMMARY
         echo "::endgroup::"
-
+        
     - name: On failure - Summarize last error
       if: ${{ failure() }}
       shell: bash
       run: |
         set +e
         echo "::group::Build Failure Analysis"
+        
+        # ✅ Guard CONFIG before using
+        if [ -z "${CONFIG:-}" ]; then
+          echo "## 🔴 Build Failed - CONFIG not set" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Build failed before device configuration was established." >> "$GITHUB_STEP_SUMMARY"
+          echo "::endgroup::"
+          exit 0
+        fi
+        
         COMMON="$GITHUB_WORKSPACE/$CONFIG/kernel_platform/common"
         
         echo "## 🔴 Build Failed - Last 120 Lines" >> "$GITHUB_STEP_SUMMARY"
@@ -1901,11 +1873,11 @@ runs:
         if [ -f "$COMMON/build.log" ]; then
           tail -n 120 "$COMMON/build.log" >> "$GITHUB_STEP_SUMMARY"
         else
-          echo "build.log not available" >> "$GITHUB_STEP_SUMMARY"
+          echo "build.log not available (file not found at: $COMMON/build.log)" >> "$GITHUB_STEP_SUMMARY"
         fi
         
         echo '```' >> "$GITHUB_STEP_SUMMARY"
-        echo "::endgroup::"       
+        echo "::endgroup::"    
    
     - name: Save Build Metadata
       id: save_metadata
