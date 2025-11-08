@@ -908,6 +908,24 @@ runs:
         fi
         echo "::endgroup::"
 
+    - name: Fix SukiSU sucompat.c unterminated directive
+      if: ${{ inputs.hook == 'manual' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Fix sucompat.c"
+        
+        SUCOMPAT="$GITHUB_WORKSPACE/$CONFIG/kernel_platform/common/drivers/kernelsu/sucompat.c"
+        
+        # Replace the problematic directive
+        sed -i 's/#ifndef KSU_HAVE_SYSCALL_TRACEPOINTS_HOOK/#ifdef CONFIG_KSU_MANUAL_HOOK/' "$SUCOMPAT"
+        
+        # Add missing #endif before the kprobe struct
+        sed -i '/^static struct kprobe execve_kp/i #endif /* CONFIG_KSU_MANUAL_HOOK */' "$SUCOMPAT"
+        
+        echo "✅ sucompat.c fixed"
+        echo "::endgroup::"
+
     - name: Apply ZRAM Patches
       if: ${{ inputs.enable_zram == 'true' }}
       shell: bash
