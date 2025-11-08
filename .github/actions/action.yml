@@ -81,14 +81,16 @@ runs:
         set -euo pipefail
         echo "::group::Parse device configuration"
         echo '${{ inputs.op_config_json }}' > /tmp/config.json
-        jq -r 'to_entries[] | "OP_\(.key | ascii_upcase)=\(.value)"' /tmp/config.json >> "$GITHUB_ENV"
+        
+        # ✅ FIXED: Quote values to survive spaces
+        jq -r 'to_entries[] | "OP_\(.key|ascii_upcase)=\"\(.value|tostring)\""' /tmp/config.json >> "$GITHUB_ENV"
         
         if jq -e '.os_version' /tmp/config.json >/dev/null 2>&1; then
           OP_OS_VERSION=$(jq -r '.os_version' /tmp/config.json)
         else
           OP_OS_VERSION="unknown"
         fi
-        echo "OP_OS_VERSION=$OP_OS_VERSION" >> "$GITHUB_ENV"
+        echo "OP_OS_VERSION=\"$OP_OS_VERSION\"" >> "$GITHUB_ENV"
         
         echo "Parsed config:"
         jq '.' /tmp/config.json
@@ -811,13 +813,13 @@ runs:
         
         echo "::endgroup::"
 
-    - name: ♻️ Restore ccache (single, stable)
+    - name: ♻️ Restore ccache
       id: cache_restore
       uses: actions/cache@v4
       if: ${{ inputs.clean != 'true' && steps.validate_cache_key.outputs.cache_valid == 'true' }}
       with:
         enableCrossOsArchive: false
-        path: ${{ env.CCACHE_DIR }}
+        path: ${{ env.CCACHE_DIR }}       
         key: ccache-suki-v4-${{ runner.os }}-${{ env.ANDROID_VER }}-${{ env.KERNEL_VER }}-${{ env.CLANG_VERSION_SHORT }}
         restore-keys: |
           ccache-suki-v4-${{ runner.os }}-${{ env.ANDROID_VER }}-${{ env.KERNEL_VER }}-
@@ -852,6 +854,10 @@ runs:
         set -euo pipefail
         export CCACHE_DIR="${CCACHE_DIR:-$HOME/.ccache}"
         mkdir -p "$CCACHE_DIR"
+                
+        if [ -z "$(find "$CCACHE_DIR" -type f 2>/dev/null | head -n1)" ]; then
+          echo "ℹ️ ccache is empty; first build may be slower"
+        fi
         
         ccache -M "${CCACHE_MAXSIZE:-3G}"
         ccache -o compression=true
@@ -1552,6 +1558,11 @@ runs:
         echo "📅 Build timestamp: $KBUILD_BUILD_TIMESTAMP (from commit $COMMIT_HASH)"
         echo "🔢 SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH"
         
+        # ✅ FIXED: Guard CLANG_BIN_PATH before using
+        if [ -z "${CLANG_BIN_PATH:-}" ]; then
+          echo "::error::CLANG_BIN_PATH is not set before build"
+          exit 1
+        fi
         export PATH="/usr/lib/ccache:${CLANG_BIN_PATH}:${PATH}"
         
         if [ "${{ inputs.clean }}" = "true" ]; then
@@ -1566,8 +1577,15 @@ runs:
         MPMAP="-fmacro-prefix-map=${WORKSPACE}=."
         FPMAP="-ffile-prefix-map=${WORKSPACE}=."
         
-        export KCFLAGS="${KCFLAGS:-} $MAP $MPMAP $FPMAP -no-canonical-prefixes -fdiagnostics-color=never -Qunused-arguments -Wno-unused-command-line-argument"
-        export KCPPFLAGS="${KCPPFLAGS:-} $MAP $MPMAP $FPMAP"
+        # ✅ FIXED: Initialize flags explicitly
+        KCFLAGS="${KCFLAGS:-}"
+        KCPPFLAGS="${KCPPFLAGS:-}"
+        
+        KCFLAGS="$KCFLAGS $MAP $MPMAP $FPMAP -no-canonical-prefixes -fdiagnostics-color=never -Qunused-arguments -Wno-unused-command-line-argument"
+        KCPPFLAGS="$KCPPFLAGS $MAP $MPMAP $FPMAP"
+        
+        export KCFLAGS
+        export KCPPFLAGS
         
         export CC="clang"
         export CXX="clang++"
@@ -1605,6 +1623,12 @@ runs:
           ccache -s | head -n 20
         fi
         echo "============================================"
+        
+        # ✅ FIXED: Fallback for scripts/config
+        if [ ! -x scripts/config ]; then
+          echo "::warning::scripts/config not found; trying to build helper scripts"
+          make O="$OUT" scripts >/dev/null 2>&1 || true
+        fi
         
         make O="$OUT" gki_defconfig
         
