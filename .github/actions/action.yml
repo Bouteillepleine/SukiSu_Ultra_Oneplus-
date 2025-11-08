@@ -1554,7 +1554,7 @@ runs:
         KERNEL_VERSION="${{ env.KERNEL_FULL_VER }}"
         DEVICE_MODEL="${{ env.OP_MODEL }}"
         BUILD_DATE=$(date -u '+%Y%m%d')
-        ZIP_NAME="SukiSU-Ultra-${DEVICE_MODEL}-${KERNEL_VERSION}-${BUILD_DATE}.zip"
+        ZIP_NAME="SukiSU-Ultra-${DEVICE_MODEL}-${KERNEL_VERSION}.zip"
         
         echo "Creating ZIP: $ZIP_NAME"
         
