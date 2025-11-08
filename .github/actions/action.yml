@@ -1373,11 +1373,13 @@ runs:
         
         echo "::endgroup::"
 
-    - name: Collect build statistics
+    - name: 📊 Collect build statistics
       id: collect_stats
+      if: always()
       shell: bash
       run: |
         set -euo pipefail
+        IFS=$'\n\t'
         echo "::group::Collect build statistics"
         
         KERNEL_PATH="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
@@ -1392,31 +1394,57 @@ runs:
         IMAGE_SIZE=$(stat -c%s "$IMG")
         IMAGE_SIZE_MB=$(awk -v s="$IMAGE_SIZE" 'BEGIN{printf "%.2f", s/1024/1024}')
         
-        # Count warnings/errors from build log
+        # Robust warning/error counts (no echo in command substitution)
         WARNINGS=0
         ERRORS=0
         if [ -f "$KERNEL_PATH/common/build.log" ]; then
-          WARNINGS=$(grep -c "warning:" "$KERNEL_PATH/common/build.log" 2>/dev/null || echo "0")
-          ERRORS=$(grep -c "error:" "$KERNEL_PATH/common/build.log" 2>/dev/null || echo "0")
+          WARNINGS=$(grep -F -c "warning:" "$KERNEL_PATH/common/build.log" 2>/dev/null || true)
+          ERRORS=$(grep -F -c "error:" "$KERNEL_PATH/common/build.log" 2>/dev/null || true)
+          WARNINGS=${WARNINGS:-0}
+          ERRORS=${ERRORS:-0}
         fi
         
-        # ✅ ONLY write to $GITHUB_OUTPUT here (grouped, single block)
+        # ✅ Validate critical outputs
+        if [[ ! "$IMAGE_SHA256" =~ ^[a-f0-9]{64}$ ]]; then
+          echo "::error::Invalid SHA256 format"
+          exit 1
+        fi
+        
+        # ✅ Only key=value lines go to $GITHUB_OUTPUT
         {
-          echo "image_sha256=${IMAGE_SHA256}"
-          echo "image_size=${IMAGE_SIZE}"
-          echo "image_size_mb=${IMAGE_SIZE_MB}"
+          echo "image_sha256=$IMAGE_SHA256"
+          echo "image_size=$IMAGE_SIZE"
+          echo "image_size_mb=$IMAGE_SIZE_MB"
           echo "build_time=${BUILD_TIME:-0}"
-          echo "warnings_count=${WARNINGS:-0}"
-          echo "errors_count=${ERRORS:-0}"
+          echo "warnings_count=$WARNINGS"
+          echo "errors_count=$ERRORS"
         } >> "$GITHUB_OUTPUT"
         
-        # ✅ Display summary to stdout ONLY (no redirection)
+        # ✅ Human-readable summary (stdout only)
+        echo ""
         echo "📊 Build Statistics:"
-        echo "   Image SHA256: ${IMAGE_SHA256}"
+        echo "   Image SHA256: $IMAGE_SHA256"
         echo "   Image Size: ${IMAGE_SIZE_MB} MB"
-        echo "   Build Time: $((BUILD_TIME / 60))m $((BUILD_TIME % 60))s"
-        echo "   Compiler Warnings: ${WARNINGS} warnings found"
-        echo "   Build Errors: ${ERRORS} errors found"
+        
+        # Safe arithmetic
+        if [ "${BUILD_TIME:-0}" -gt 0 ]; then
+          echo "   Build Time: $((BUILD_TIME / 60))m $((BUILD_TIME % 60))s"
+        else
+          echo "   Build Time: N/A"
+        fi
+        
+        # Conditional formatting
+        if [ "${WARNINGS}" -eq 0 ]; then
+          echo "   Compiler Warnings: ✅ None"
+        else
+          echo "   Compiler Warnings: ⚠️ ${WARNINGS} found"
+        fi
+        
+        if [ "${ERRORS}" -eq 0 ]; then
+          echo "   Build Errors: ✅ None"
+        else
+          echo "   Build Errors: ❌ ${ERRORS} found"
+        fi
         
         echo "::endgroup::"
     
