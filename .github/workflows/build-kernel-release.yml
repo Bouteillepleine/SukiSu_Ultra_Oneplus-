@@ -220,6 +220,78 @@ jobs:
           
           echo "::endgroup::"
 
+      - name: 🔧 Create and Enable 3GB Swap
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          echo "::group::Swap configuration"
+          
+          # Deactivate any existing swap to avoid fragmentation/conflicts
+          sudo swapoff -a 2>/dev/null || true
+          
+          if [ ! -f /swapfile ]; then
+            # Clear unusual attributes if present (best-effort)
+            sudo chattr -i -a /swapfile 2>/dev/null || true
+            
+            # Prefer fallocate (fast); fallback to dd (portable)
+            if sudo fallocate -l 3G /swapfile 2>/dev/null; then
+              # Verify non-sparse (critical for exotic filesystems)
+              alloc_mb="$(sudo du -m /swapfile | awk '{print $1}')"
+              if [ "${alloc_mb:-0}" -lt 3072 ]; then
+                sudo rm -f /swapfile
+                sudo dd if=/dev/zero of=/swapfile bs=1M count=3072 status=none
+              fi
+            else
+              sudo rm -f /swapfile
+              sudo dd if=/dev/zero of=/swapfile bs=1M count=3072 status=none
+            fi
+            
+            # Disable CoW after creation (best-effort; harmless if unsupported)
+            sudo chattr +C /swapfile 2>/dev/null || true
+            
+            # Secure ownership and permissions
+            sudo chown root:root /swapfile
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile >/dev/null
+          fi
+          
+          # Enable swap; if header invalid, re-create and retry
+          sudo swapon /swapfile 2>/dev/null || {
+            sudo mkswap /swapfile >/dev/null
+            sudo swapon /swapfile
+          }
+          
+          # Optionally protect the swapfile from accidental modification
+          sudo chattr +i /swapfile 2>/dev/null || true
+          
+          # Ephemeral memory tuning for CI
+          sudo install -m 0644 /dev/null /etc/sysctl.d/99-swap.conf
+          sudo tee /etc/sysctl.d/99-swap.conf >/dev/null <<'SYSCTL_EOF'
+          vm.swappiness=5
+          vm.vfs_cache_pressure=50
+          SYSCTL_EOF
+          sudo chown root:root /etc/sysctl.d/99-swap.conf
+          sudo sysctl -p /etc/sysctl.d/99-swap.conf >/dev/null
+          
+          # Visibility: memory + active swap device
+          echo ""
+          echo "Memory status:"
+          free -h
+          echo ""
+          echo "Swap devices:"
+          swapon --show
+          
+          # Sanity: confirm our swapfile is active
+          if ! swapon --show=NAME | grep -q '^/swapfile$'; then
+            echo "::error::Swap file /swapfile not active"
+            exit 1
+          fi
+          
+          echo ""
+          echo "✅ Swap configured successfully"
+          echo "::endgroup::"
+
       - name: 🔨 Build ${{ matrix.model }}
         id: build
         uses: ./.github/actions
