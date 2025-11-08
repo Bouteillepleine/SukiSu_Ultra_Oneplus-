@@ -287,12 +287,14 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.model }}-kernel
-          path: ${{ steps.build.outputs.zip_path }}
+          name: ${{ matrix.model }}-${{ matrix.android_version }}
+          path: |
+            ${{ matrix.model }}/kernel_platform/artifacts/*.zip
+            ${{ matrix.model }}/kernel_platform/artifacts/build_info.json
           retention-days: 30
           if-no-files-found: error
-
-      # ✅ FIX: Use dynamic path for metadata
+          compression-level: 6
+      
       - name: 📤 Upload build metadata
         if: success()
         uses: actions/upload-artifact@v4
@@ -300,7 +302,7 @@ jobs:
           name: ${{ matrix.model }}-metadata
           path: |
             ${{ matrix.model }}/kernel_platform/artifacts/build_info.json
-            ${{ matrix.model }}/kernel_platform/artifacts/kernel_version.txt
+            ${{ matrix.model }}/kernel_platform/artifacts/*.txt
           retention-days: 30
           if-no-files-found: warn
 
