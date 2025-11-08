@@ -89,10 +89,20 @@ jobs:
         with:
           sparse-checkout: configs/
 
+      # ✅ FIX 1: Ensure required CLI tools
+      - name: 🧰 Ensure tools
+        run: |
+          set -euo pipefail
+          echo "::group::Install dependencies"
+          sudo apt-get update -y
+          sudo apt-get install -y jq unzip bc
+          echo "✅ Tools installed: jq=$(jq --version), unzip=$(unzip -v | head -1), bc=$(bc --version | head -1)"
+          echo "::endgroup::"
+
       - name: 🔍 Generate build matrix
         id: matrix
         run: |
-          set -euo pipefail  # ✅ Strict error handling
+          set -euo pipefail
           echo "::group::Matrix generation"
           
           [ ! -d configs ] && { echo "::error::configs/ not found"; exit 1; }
@@ -103,7 +113,6 @@ jobs:
           for f in configs/*.json; do
             [ ! -f "$f" ] && continue
             
-            # ✅ Hard fail on invalid JSON (removed warning fallback)
             if ! jq empty "$f" 2>/dev/null; then
               echo "::error::Invalid JSON in $f"
               exit 1
@@ -129,7 +138,6 @@ jobs:
             filter="map(select(.model==\"$input\"))"
           fi
           
-          # ✅ A) Deterministic matrix order - sort by model before filtering
           result=$(jq -c '[.[] | .] | sort_by(.model) | '"$filter" matrix.json)
           count=$(jq 'length' <<<"$result")
           
@@ -145,6 +153,7 @@ jobs:
           
           echo "::endgroup::"
 
+      # ✅ FIX 2: Use steps.matrix instead of needs.setup
       - name: 📊 Build plan summary
         run: |
           cat >> $GITHUB_STEP_SUMMARY << EOF
@@ -164,7 +173,7 @@ jobs:
           ### 📋 Build Queue
           EOF
           
-          echo '${{ needs.setup.outputs.matrix }}' | \
+          echo '${{ steps.matrix.outputs.result }}' | \
             jq -r '.include[] | "- `\(.model)` - Android \(.android_version) / Kernel \(.kernel_version)"' \
             >> $GITHUB_STEP_SUMMARY
 
@@ -178,6 +187,7 @@ jobs:
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
 
+      # ✅ FIX 3: Enhanced disk cleanup with journal vacuum and apt cache purge
       - name: 🧹 Free Up Disk Space
         run: |
           set -euo pipefail
@@ -193,9 +203,12 @@ jobs:
           sudo rm -rf /opt/ghc
           sudo rm -rf /opt/hostedtoolcache/CodeQL
           
-          # ✅ B) Enhanced apt cleanup
+          # Enhanced apt cleanup
+          echo "Cleaning apt..."
           sudo apt-get clean
-          sudo apt-get autoremove -y  # ✅ Reclaim more space
+          sudo apt-get autoremove -y
+          sudo journalctl --vacuum-time=1s >/dev/null 2>&1 || true
+          sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
           
           # Docker cleanup
           echo "Cleaning Docker..."
@@ -220,6 +233,7 @@ jobs:
           
           echo "::endgroup::"
 
+      # ✅ FIX 4: Swap step with symmetry and immutable-attr handling
       - name: 🔧 Create and Enable 3GB Swap
         shell: bash
         run: |
@@ -227,13 +241,13 @@ jobs:
           
           echo "::group::Swap configuration"
           
-          # Deactivate any existing swap to avoid fragmentation/conflicts
+          # Deactivate any existing swap
           sudo swapoff -a 2>/dev/null || true
           
+          # Always clear immutable before touching (symmetry)
+          sudo chattr -i -a /swapfile 2>/dev/null || true
+          
           if [ ! -f /swapfile ]; then
-            # Clear unusual attributes if present (best-effort)
-            sudo chattr -i -a /swapfile 2>/dev/null || true
-            
             # Prefer fallocate (fast); fallback to dd (portable)
             if sudo fallocate -l 3G /swapfile 2>/dev/null; then
               # Verify non-sparse (critical for exotic filesystems)
@@ -262,7 +276,7 @@ jobs:
             sudo swapon /swapfile
           }
           
-          # Optionally protect the swapfile from accidental modification
+          # Protect the swapfile from accidental modification
           sudo chattr +i /swapfile 2>/dev/null || true
           
           # Ephemeral memory tuning for CI
@@ -357,7 +371,7 @@ jobs:
           path: ${{ matrix.model }}/artifacts/${{ steps.build.outputs.zip_name }}
           retention-days: 30
           compression-level: 9
-          if-no-files-found: error  # ✅ C) Strict artifact upload
+          if-no-files-found: error
 
       - name: 📝 Job summary
         if: always()
@@ -406,6 +420,7 @@ jobs:
         with:
           fetch-depth: 0
 
+      # ✅ FIX 5: Tag race tolerance with retry logic
       - name: 🏷️ Generate release tag
         id: tag
         run: |
@@ -419,7 +434,7 @@ jobs:
             tag="v1.5.12-r0"
             echo "🆕 Creating initial tag: $tag"
           else
-            rev=$(echo $latest | grep -oP 'r\K\d+')
+            rev=$(echo "$latest" | grep -oP 'r\K\d+')
             tag="v1.5.12-r$((rev + 1))"
             echo "📈 Incrementing from $latest to $tag"
           fi
@@ -429,8 +444,20 @@ jobs:
           
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "$tag" -m "Release $tag - $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          git push origin "$tag"
+          git tag -a "$tag" -m "Release $tag - $(date -u '+%Y-%m-%d %H:%M:%S UTC')" || true
+          
+          # Push with race tolerance
+          if ! git push origin "$tag" 2>&1; then
+            echo "⚠️ Tag push failed (possible race), retrying with bump..."
+            git fetch --tags
+            latest=$(git tag -l "v1.5.12-r*" | sort -V | tail -1)
+            rev=$(echo "$latest" | grep -oP 'r\K\d+')
+            tag="v1.5.12-r$((rev + 1))"
+            git tag -a "$tag" -m "Release $tag - $(date -u '+%Y-%m-%d %H:%M:%S UTC')" -f
+            sed -i "s/^TAG=.*/TAG=$tag/" $GITHUB_ENV || echo "TAG=$tag" >> $GITHUB_ENV
+            echo "tag=$tag" >> $GITHUB_OUTPUT
+            git push origin "$tag" -f
+          fi
           
           echo "✅ Tag created and pushed: $tag"
           echo "::endgroup::"
@@ -442,6 +469,7 @@ jobs:
           pattern: '*-kernel'
           merge-multiple: true
 
+      # ✅ FIX 6: Deterministic SUSFS version extraction (avoid double unzip)
       - name: 📦 Prepare release assets
         id: prepare
         run: |
@@ -468,13 +496,20 @@ jobs:
           echo "count=$count" >> $GITHUB_OUTPUT
           echo "total_size=$total_size" >> $GITHUB_OUTPUT
           
-          # Extract SUSFS version from first artifact
-          FIRST_ZIP=$(ls release/*.zip | head -1)
+          # Extract SUSFS version deterministically (first ZIP, sorted)
+          FIRST_ZIP=$(ls release/*.zip | sort | head -1)
           SUSFS_VER="v1.5.12"  # Default
           
-          if unzip -p "$FIRST_ZIP" "*.txt" 2>/dev/null | grep -q "SUSFS"; then
-            SUSFS_VER=$(unzip -p "$FIRST_ZIP" "*.txt" 2>/dev/null | grep -oP 'SUSFS: \Kv[0-9.]+' | head -1 || echo "v1.5.12")
+          # Extract once and cache
+          TMP_DIR=$(mktemp -d)
+          if unzip -q "$FIRST_ZIP" -d "$TMP_DIR" 2>/dev/null; then
+            # Find first .txt file deterministically
+            INFO_FILE=$(find "$TMP_DIR" -name "*.txt" -type f | sort | head -1)
+            if [ -n "$INFO_FILE" ] && grep -q "SUSFS" "$INFO_FILE"; then
+              SUSFS_VER=$(grep -oP 'SUSFS: \Kv[0-9.]+' "$INFO_FILE" | head -1 || echo "v1.5.12")
+            fi
           fi
+          rm -rf "$TMP_DIR"
           
           echo "susfs_version=$SUSFS_VER" >> $GITHUB_OUTPUT
           
@@ -514,12 +549,19 @@ jobs:
           - [SukiSU Manager](https://github.com/SukiSU-Ultra/SukiSU-Ultra)
           - [Report Issues](https://github.com/${{ github.repository }}/issues)
           
-          ## 📊 Build Info
-          - **Built on:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-          - **Workflow:** ${{ github.workflow }}
-          - **Run:** [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-          - **Configuration:** Hook=${{ github.event.inputs.hook }}, Optimization=${{ github.event.inputs.optimize_level }}
+          ## 📊 Build Configuration
           EOF
+          
+          cat >> notes.md << NOTES_EOF
+          - **Hook Type:** \`${{ github.event.inputs.hook }}\`
+          - **Optimization:** \`${{ github.event.inputs.optimize_level }}\`
+          - **ZRAM:** ${{ github.event.inputs.enable_zram }}
+          - **BBG LSM:** ${{ github.event.inputs.lsm }}
+          - **Fengchi Scheduler:** ${{ github.event.inputs.sched }}
+          - **Clean Build:** ${{ github.event.inputs.clean_build }}
+          - **Built on:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          - **Workflow Run:** [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          NOTES_EOF
           
           echo "::endgroup::"
 
@@ -578,28 +620,47 @@ jobs:
           done
 
       - name: 🧹 Cleanup on failure or cancellation
-        if: failure() || cancelled()  # ✅ D) Handle cancelled workflows
+        if: failure() || cancelled()
         run: |
           set +e  # Don't fail on cleanup errors
           echo "::group::Cleanup failed/cancelled release"
           
+          # Show what went wrong
+          echo "Job status: ${{ job.status }}"
+          echo "Attempting cleanup for tag: $TAG"
+          
           # Delete remote tag
           if git ls-remote --tags origin | grep -q "$TAG"; then
-            echo "Deleting remote tag: $TAG"
-            git push origin --delete "$TAG" 2>/dev/null || echo "Failed to delete remote tag"
+            echo "🗑️ Deleting remote tag: $TAG"
+            if git push origin --delete "$TAG" 2>&1; then
+              echo "✅ Remote tag deleted"
+            else
+              echo "⚠️ Failed to delete remote tag (may not exist)"
+            fi
+          else
+            echo "ℹ️ Remote tag $TAG not found"
           fi
           
           # Delete local tag
           if git tag -l | grep -q "^$TAG$"; then
-            echo "Deleting local tag: $TAG"
-            git tag -d "$TAG" 2>/dev/null || echo "Failed to delete local tag"
+            echo "🗑️ Deleting local tag: $TAG"
+            git tag -d "$TAG" 2>/dev/null && echo "✅ Local tag deleted" || echo "⚠️ Failed to delete local tag"
+          else
+            echo "ℹ️ Local tag $TAG not found"
           fi
           
           # Try to delete release if it was created
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Deleting release: $TAG"
-            gh release delete "$TAG" --yes 2>/dev/null || echo "Failed to delete release"
+            echo "🗑️ Deleting GitHub release: $TAG"
+            if gh release delete "$TAG" --yes 2>&1; then
+              echo "✅ Release deleted"
+            else
+              echo "⚠️ Failed to delete release"
+            fi
+          else
+            echo "ℹ️ Release $TAG not found (may not have been created)"
           fi
           
-          echo "✅ Cleanup completed"
+          echo ""
+          echo "✅ Cleanup completed (best effort)"
           echo "::endgroup::"
