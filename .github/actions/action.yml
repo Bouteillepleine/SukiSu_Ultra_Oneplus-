@@ -917,13 +917,20 @@ runs:
         
         SUCOMPAT="$GITHUB_WORKSPACE/$CONFIG/kernel_platform/common/drivers/kernelsu/sucompat.c"
         
-        # Replace the problematic directive
+        # Replace the directive
         sed -i 's/#ifndef KSU_HAVE_SYSCALL_TRACEPOINTS_HOOK/#ifdef CONFIG_KSU_MANUAL_HOOK/' "$SUCOMPAT"
         
-        # Add missing #endif before the kprobe struct
-        sed -i '/^static struct kprobe execve_kp/i #endif /* CONFIG_KSU_MANUAL_HOOK */' "$SUCOMPAT"
+        # Find line with "ksu_handle_execveat_sucompat" and add #endif 2 lines after
+        line=$(grep -n 'ksu_handle_execveat_sucompat' "$SUCOMPAT" | tail -1 | cut -d: -f1)
+        if [ -n "$line" ]; then
+          # Add #endif after "return 0;" and "}"
+          sed -i "$((line + 2))a #endif /* CONFIG_KSU_MANUAL_HOOK */" "$SUCOMPAT"
+          echo "✅ sucompat.c fixed"
+        else
+          echo "::error::Could not find insertion point"
+          exit 1
+        fi
         
-        echo "✅ sucompat.c fixed"
         echo "::endgroup::"
 
     - name: Apply ZRAM Patches
