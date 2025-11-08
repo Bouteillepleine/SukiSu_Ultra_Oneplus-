@@ -1788,6 +1788,38 @@ runs:
         echo "============================================"
         echo "::endgroup::"
 
+    - name: 📊 Collect ccache Statistics
+      id: ccache_stats
+      if: ${{ inputs.clean != 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::ccache statistics"
+        if ! command -v ccache >/dev/null 2>&1; then
+          echo "hit_rate=0" >> "$GITHUB_OUTPUT"
+          echo "direct_rate=0" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+          exit 0
+        fi
+        STATS=$(ccache -s)
+        CACHE_HIT=$(echo "$STATS" | grep -oP 'cache hit \(direct\)\s+\K[0-9]+' || echo "0")
+        CACHE_MISS=$(echo "$STATS" | grep -oP 'cache miss\s+\K[0-9]+' || echo "0")
+        PREPROCESSED_HIT=$(echo "$STATS" | grep -oP 'cache hit \(preprocessed\)\s+\K[0-9]+' || echo "0")
+        TOTAL_HITS=$((CACHE_HIT + PREPROCESSED_HIT))
+        TOTAL_ATTEMPTS=$((TOTAL_HITS + CACHE_MISS))
+        if [ "$TOTAL_ATTEMPTS" -gt 0 ]; then
+          HIT_RATE=$(awk "BEGIN {printf \"%.1f\", ($TOTAL_HITS / $TOTAL_ATTEMPTS) * 100}")
+          DIRECT_RATE=$(awk "BEGIN {printf \"%.1f\", ($CACHE_HIT / $TOTAL_ATTEMPTS) * 100}")
+        else
+          HIT_RATE="0.0"
+          DIRECT_RATE="0.0"
+        fi
+        echo "hit_rate=$HIT_RATE" >> "$GITHUB_OUTPUT"
+        echo "direct_rate=$DIRECT_RATE" >> "$GITHUB_OUTPUT"
+        echo "📊 ccache: ${HIT_RATE}% hit rate (${DIRECT_RATE}% direct)"
+        ccache -s
+        echo "::endgroup::"
+
     - name: 📊 Cache Status
       if: ${{ inputs.clean != 'true' }}
       shell: bash
