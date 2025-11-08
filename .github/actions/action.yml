@@ -160,6 +160,16 @@ runs:
         echo "  Optimization: $optimize"
         echo "::endgroup::"
 
+    - name: 📦 Cache APT Build Dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          /var/cache/apt/archives
+          /var/lib/apt/lists
+        key: apt-kernel-build-${{ runner.os }}-v1
+        restore-keys: |
+          apt-kernel-build-${{ runner.os }}-
+  
     - name: Install Minimal Dependencies
       shell: bash
       run: |
@@ -169,8 +179,7 @@ runs:
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
           git curl ca-certificates build-essential clang lld flex bison \
           libelf-dev libssl-dev libncurses-dev zlib1g-dev liblz4-tool \
-          libxml2-utils rsync unzip dwarves file python3 ccache jq bc dos2unix
-        sudo apt-get clean
+          libxml2-utils rsync unzip dwarves file python3 ccache jq bc dos2unix        
         echo "✅ Dependencies installed"
         echo "::endgroup::"
 
