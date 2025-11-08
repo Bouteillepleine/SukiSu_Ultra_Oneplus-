@@ -66,6 +66,7 @@ on:
           - apt_only
           - kernel_only
           - old_only
+          - migrate_legacy  # NEW: Added migration pattern
       
       cache_age_days:
         description: 'Delete caches older than (days)'
@@ -114,26 +115,19 @@ jobs:
             const MAX_SIZE_GB = 10;
             const MAX_SIZE_BYTES = MAX_SIZE_GB * 1024 * 1024 * 1024;
             
-            // ✅ UPDATED: Tolerant v3 regex that accepts both ccache-v3-* and ccache-suki-v3-*
+            // Cache key patterns
             const CACHE_PATTERNS = {
-              // v4 format: ccache-suki-v4-MODEL-OS-ANDROID-KERNEL-CLANG
               v4: /^ccache-suki-v4-([^-]+)-([^-]+)-([^-]+)-([^-]+)-([^-]+)$/,
-              
-              // ✅ NEW: Tolerant v3 format that accepts both forms
-              // Matches: ccache-v3-* AND ccache-suki-v3-*
-              // Groups: (1) android, (2) kernel, (3) device
               v3: /^ccache-(?:suki-)?v3-([^-]+)-([0-9.]+)-(?:[A-Za-z0-9.-]+-)?(?:clang-[A-Za-z0-9.-]+-)?([A-Za-z0-9._-]+)(?:-.+)?$/,
-              
-              // Legacy formats
               legacy1: /^ccache-[^-]+-[\d.]+-[^-]+-clang-[^-]+-([^-]+)$/,
               legacy2: /^ccache-[^-]+-[\d.]+-[^-]+-([^-]+)$/,
               legacy3: /ccache-[^-]+-[^-]+-[^-]+-[^-]+-([^-]+)/
             };
             
-            // ✅ NEW: Safe number formatting helpers
+            // Safe number formatting helpers
             const toGB = bytes => bytes / 1024 / 1024 / 1024;
             const fmtGB = (bytes, countHint = 0) => {
-              if (bytes === 0 && countHint > 0) return '0.00'; // brand-new cache
+              if (bytes === 0 && countHint > 0) return '0.00';
               const g = toGB(bytes);
               return g > 0 && g < 0.01 ? '<0.01' : g.toFixed(2);
             };
@@ -190,16 +184,16 @@ jobs:
               },
               cachesByDevice: new Map(),
               ageDistribution: {
-                fresh: 0,      // < 7 days
-                recent: 0,     // 7-14 days
-                old: 0,        // 14-30 days
-                stale: 0       // > 30 days
+                fresh: 0,
+                recent: 0,
+                old: 0,
+                stale: 0
               },
               activityDistribution: {
-                active: 0,     // < 7 days
-                recent: 0,     // 7-14 days
-                dormant: 0,    // 14-30 days
-                stale: 0       // > 30 days
+                active: 0,
+                recent: 0,
+                dormant: 0,
+                stale: 0
               },
               oldestCache: null,
               newestCache: null
@@ -242,7 +236,6 @@ jobs:
                 stats.cachesByType.ccache.size += cache.size_in_bytes;
                 stats.cachesByType.ccache.count++;
                 
-                // ✅ UPDATED: Parse cache key format with tolerant v3 regex
                 let device = null;
                 let osVersion = null;
                 let androidVer = null;
@@ -255,21 +248,20 @@ jobs:
                 if (v4Match) {
                   stats.cacheKeyVersions.v4++;
                   isV4 = true;
-                  device = v4Match[1];        // OP13
-                  osVersion = v4Match[2];     // OOS15
-                  androidVer = v4Match[3];    // android14
-                  kernelVer = v4Match[4];     // 6.1
-                  // clangVer = v4Match[5];   // r510928
+                  device = v4Match[1];
+                  osVersion = v4Match[2];
+                  androidVer = v4Match[3];
+                  kernelVer = v4Match[4];
                 } 
-                // ✅ UPDATED: Try tolerant v3 format (accepts both ccache-v3-* and ccache-suki-v3-*)
+                // Try v3 format
                 else {
                   const v3Match = cache.key.match(CACHE_PATTERNS.v3);
                   if (v3Match) {
                     stats.cacheKeyVersions.v3++;
                     isV3 = true;
-                    androidVer = v3Match[1];  // android14
-                    kernelVer = v3Match[2];   // 6.1
-                    device = v3Match[3];      // OP-ACE-5 or OP-ACE-3V
+                    androidVer = v3Match[1];
+                    kernelVer = v3Match[2];
+                    device = v3Match[3];
                   }
                   // Try legacy formats
                   else {
@@ -347,7 +339,6 @@ jobs:
               }
             }
             
-            // ✅ UPDATED: Safe usage percent calculation
             const usagePercent = stats.totalSize > 0 ? (stats.totalSize / MAX_SIZE_BYTES) * 100 : 0;
             const usagePercentStr = usagePercent.toFixed(1);
             
@@ -381,7 +372,6 @@ jobs:
               legacyCount: data.legacyCount
             })).sort((a, b) => b.size - a.size);
             
-            // ✅ UPDATED: Use safe formatting helpers
             const totalSizeGB = fmtGB(stats.totalSize, stats.totalCount);
             
             let healthEmoji = '🟢';
@@ -401,7 +391,6 @@ jobs:
                 ['Recommendation', recommendation, '']
               ]);
             
-            // ✅ UPDATED: Use safe formatting for cache breakdown
             summary.addHeading('🗂️ Cache Breakdown by Type', 3)
               .addTable([
                 [{data: 'Type', header: true}, {data: 'Count', header: true}, {data: 'Size (GB)', header: true}, {data: 'Percentage', header: true}],
@@ -423,7 +412,6 @@ jobs:
                  pct(stats.cachesByType.other.size, stats.totalSize)]
               ]);
             
-            // ✅ UPDATED: Clarified v3 label to show both forms accepted
             const totalVersionedCaches = stats.cacheKeyVersions.v4 + stats.cacheKeyVersions.v3 + stats.cacheKeyVersions.legacy;
             summary.addHeading('🔑 Cache Key Versions', 3)
               .addTable([
@@ -579,11 +567,9 @@ jobs:
             const cacheAgeDays = parseInt('${{ inputs.cache_age_days }}');
             const forceCleanup = '${{ inputs.force_cleanup }}' === 'true';
             
-            // ✅ UPDATED: Tolerant v3 regex
             const V4_PATTERN = /^ccache-suki-v4-([^-]+)-([^-]+)-([^-]+)-([^-]+)-([^-]+)$/;
             const V3_PATTERN = /^ccache-(?:suki-)?v3-([^-]+)-([0-9.]+)-(?:[A-Za-z0-9.-]+-)?(?:clang-[A-Za-z0-9.-]+-)?([A-Za-z0-9._-]+)(?:-.+)?$/;
             
-            // ✅ NEW: Safe number formatting helpers
             const toGB = bytes => bytes / 1024 / 1024 / 1024;
             const fmtGB = (bytes, countHint = 0) => {
               if (bytes === 0 && countHint > 0) return '0.00';
@@ -656,19 +642,17 @@ jobs:
               let device = null;
               let kernel = null;
               
-              // ✅ UPDATED: Parse with tolerant v3 regex
               if (isV4Format) {
                 const v4Match = cacheKey.match(V4_PATTERN);
                 if (v4Match) {
-                  device = v4Match[1];        // OP13
-                  kernel = v4Match[4];        // 6.1
+                  device = v4Match[1];
+                  kernel = v4Match[4];
                 }
               } else if (isV3Format) {
                 const v3Match = cacheKey.match(V3_PATTERN);
                 if (v3Match) {
-                  // androidVer = v3Match[1]; // android14
-                  kernel = v3Match[2];        // 6.1
-                  device = v3Match[3];        // OP-ACE-5 or OP-ACE-3V
+                  kernel = v3Match[2];
+                  device = v3Match[3];
                 }
               } else if (cacheKey.startsWith('ccache-')) {
                 // Legacy format
@@ -739,6 +723,14 @@ jobs:
                     category = cacheKey.startsWith('ccache-') ? 'ccache' :
                               cacheKey.startsWith('apt-') ? 'apt' :
                               (cacheKey.includes('kernel') || cacheKey.includes('linux-')) ? 'kernel' : 'other';
+                  }
+                  break;
+                
+                // ✅ NEW: Legacy migration pattern
+                case 'migrate_legacy':
+                  if (cacheKey.startsWith('ccache-') && !isV4Format && !isV3Format) {
+                    patternMatch = true;
+                    category = 'ccache';
                   }
                   break;
               }
@@ -828,7 +820,6 @@ jobs:
               }
             }
             
-            // ✅ UPDATED: Use safe formatting
             const freedGB = fmtGB(totalFreed, totalDeleted);
             
             console.log(`\n✅ Cleanup ${dryRun ? 'simulation' : 'complete'}:`);
@@ -855,7 +846,6 @@ jobs:
                 ['Force Cleanup', forceCleanup ? 'Yes' : 'No']
               ]);
             
-            // ✅ UPDATED: Use safe formatting
             summary.addHeading('🗂️ Deletion Breakdown by Type', 3)
               .addTable([
                 [{data: 'Type', header: true}, {data: 'Count', header: true}, {data: 'Size (GB)', header: true}, {data: 'Percentage', header: true}],
@@ -940,7 +930,6 @@ jobs:
             const keepDays = 30;
             const keepRecent = 5;
             
-            // ✅ NEW: Safe percentage helper
             const pct = (part, total) => total > 0 ? ((part / total) * 100).toFixed(1) + '%' : '0.0%';
             
             async function withRetry(fn, maxRetries = 3) {
@@ -1078,7 +1067,6 @@ jobs:
                 ['Keep Recent Successful', `${keepRecent} per workflow`]
               ]);
             
-            // ✅ UPDATED: Use safe percentage helper
             summary.addHeading('📈 Deletions by Status', 3)
               .addTable([
                 [{data: 'Status', header: true}, {data: 'Count', header: true}, {data: 'Percentage', header: true}],
@@ -1114,15 +1102,33 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
+            // ✅ FIX #2: Check if analyze job succeeded
+            const analyzeStatus = '${{ needs.analyze.result }}';
+            if (analyzeStatus !== 'success') {
+              console.log(`⚠️ Analyze job ${analyzeStatus}, cannot generate full report`);
+              
+              const summary = core.summary
+                .addHeading('⚠️ Incomplete Report', 2)
+                .addRaw(`\n**Report Date:** ${new Date().toISOString()}\n\n`)
+                .addRaw(`The analyze job ${analyzeStatus}. Cannot generate full report.\n\n`);
+              
+              if (analyzeStatus === 'failure') {
+                summary.addRaw(`> ❌ **Error**: The analysis step failed. Check the logs for details.\n`);
+              } else if (analyzeStatus === 'cancelled') {
+                summary.addRaw(`> ⏭️ **Cancelled**: The analysis step was cancelled.\n`);
+              }
+              
+              await summary.write();
+              return;
+            }
+            
             const { owner, repo } = context.repo;
             const dryRun = '${{ inputs.dry_run }}' === 'true';
             const cleanupType = '${{ inputs.cleanup_type }}';
             
-            // ✅ UPDATED: Tolerant v3 regex
             const V4_PATTERN = /^ccache-suki-v4-([^-]+)-([^-]+)-([^-]+)-([^-]+)-([^-]+)$/;
             const V3_PATTERN = /^ccache-(?:suki-)?v3-([^-]+)-([0-9.]+)-(?:[A-Za-z0-9.-]+-)?(?:clang-[A-Za-z0-9.-]+-)?([A-Za-z0-9._-]+)(?:-.+)?$/;
             
-            // ✅ NEW: Safe number formatting helpers
             const toGB = bytes => bytes / 1024 / 1024 / 1024;
             const fmtGB = (bytes, countHint = 0) => {
               if (bytes === 0 && countHint > 0) return '0.00';
@@ -1155,8 +1161,9 @@ jobs:
             
             console.log('📊 Generating final report...\n');
             
-            // ✅ UPDATED: Parse beforeSize as number (it's already in GB from analyze job)
-            const beforeSize = parseFloat('${{ needs.analyze.outputs.total_size }}') || 0;
+            // ✅ FIX #1 & #3: Clarified variable names and fixed calculations
+            // beforeSizeGB is already in GB from analyze job output
+            const beforeSizeGB = parseFloat('${{ needs.analyze.outputs.total_size }}') || 0;
             const beforeCount = parseInt('${{ needs.analyze.outputs.total_count }}') || 0;
             
             let totalCacheSize = 0;
@@ -1183,19 +1190,17 @@ jobs:
                 
                 let device = null;
                 
-                // ✅ UPDATED: Parse device from cache key with tolerant v3 regex
                 if (isV4Format) {
                   const v4Match = cache.key.match(V4_PATTERN);
                   if (v4Match) {
-                    device = v4Match[1]; // OP13
+                    device = v4Match[1];
                   }
                 } else if (isV3Format) {
                   const v3Match = cache.key.match(V3_PATTERN);
                   if (v3Match) {
-                    device = v3Match[3]; // OP-ACE-5 or OP-ACE-3V
+                    device = v3Match[3];
                   }
                 } else {
-                  // Legacy format
                   const legacy1 = cache.key.match(/^ccache-[^-]+-[\d.]+-[^-]+-clang-[^-]+-([^-]+)$/);
                   const legacy2 = cache.key.match(/^ccache-[^-]+-[\d.]+-[^-]+-([^-]+)$/);
                   device = legacy1?.[1] || legacy2?.[1] || null;
@@ -1213,23 +1218,32 @@ jobs:
               }
             }
             
-            // ✅ UPDATED: Safe calculations
-            const afterSizeGBNum = toGB(totalCacheSize);
-            const afterSizeGB = fmtGB(totalCacheSize, cacheCount);
-            const maxCacheSize = 10 * 1024 * 1024 * 1024;
-            const afterPercentNum = totalCacheSize > 0 ? (totalCacheSize / maxCacheSize) * 100 : 0;
-            const afterPercent = afterPercentNum.toFixed(1);
+            // ✅ FIX #1 & #3: Calculate current cache size (after cleanup)
+            const afterSizeBytes = totalCacheSize;
+            const afterSizeGBNum = toGB(afterSizeBytes);
+            const afterSizeGBStr = fmtGB(afterSizeBytes, cacheCount);
             
-            const freedSpace = beforeSize - afterSizeGBNum;
+            // Calculate usage percentage
+            const maxCacheSizeBytes = 10 * 1024 * 1024 * 1024;  // 10 GB in bytes
+            const afterUsagePercent = afterSizeBytes > 0 
+              ? ((afterSizeBytes / maxCacheSizeBytes) * 100).toFixed(1)
+              : '0.0';
+            
+            // Calculate changes (beforeSizeGB is already in GB from analyze job)
+            const freedSpaceGB = beforeSizeGB - afterSizeGBNum;
             const freedCaches = beforeCount - cacheCount;
-            const beforeUsage = beforeSize > 0 ? ((beforeSize / 10) * 100).toFixed(1) : '0.0';
+            const beforeUsagePercent = beforeSizeGB > 0 
+              ? ((beforeSizeGB / 10) * 100).toFixed(1) 
+              : '0.0';
+            
+            const afterUsagePercentNum = parseFloat(afterUsagePercent);
             
             let healthEmoji = '🟢';
             let healthStatus = 'Healthy';
-            if (afterPercentNum > 90) {
+            if (afterUsagePercentNum > 90) {
               healthEmoji = '🔴';
               healthStatus = 'Critical';
-            } else if (afterPercentNum > 75) {
+            } else if (afterUsagePercentNum > 75) {
               healthEmoji = '🟡';
               healthStatus = 'Warning';
             }
@@ -1241,23 +1255,22 @@ jobs:
             if (dryRun) {
               summary.addRaw(`> ⚠️ **DRY RUN MODE** - This is a simulation. No actual changes were made.\n\n`);
             }
-            
-            // ✅ UPDATED: Use safe formatting and calculations
+                        // ✅ FIX #1 & #3: Updated table with corrected calculations
             summary.addHeading('📊 Before vs After', 3)
               .addTable([
                 [{data: 'Metric', header: true}, {data: 'Before', header: true}, {data: 'After', header: true}, {data: 'Change', header: true}],
                 ['Cache Size', 
-                 `${beforeSize.toFixed(2)} GB`, 
-                 `${afterSizeGB} GB`, 
-                 dryRun ? `Would free ${freedSpace.toFixed(2)} GB` : `Freed ${freedSpace.toFixed(2)} GB`],
+                 `${beforeSizeGB.toFixed(2)} GB`, 
+                 `${afterSizeGBStr} GB`, 
+                 dryRun ? `Would free ${freedSpaceGB.toFixed(2)} GB` : `Freed ${freedSpaceGB.toFixed(2)} GB`],
                 ['Cache Count', 
                  beforeCount.toString(), 
                  cacheCount.toString(), 
                  dryRun ? `Would delete ${freedCaches}` : `Deleted ${freedCaches}`],
                 ['Usage %', 
-                 `${beforeUsage}%`, 
-                 `${afterPercent}%`, 
-                 `${(parseFloat(beforeUsage) - parseFloat(afterPercent)).toFixed(1)}% reduction`],
+                 `${beforeUsagePercent}%`, 
+                 `${afterUsagePercent}%`, 
+                 `${(parseFloat(beforeUsagePercent) - parseFloat(afterUsagePercent)).toFixed(1)}% reduction`],
                 ['Health', 
                  '', 
                  healthStatus, 
@@ -1287,12 +1300,12 @@ jobs:
             
             summary.addHeading('💡 Recommendations', 3);
             
-            if (afterPercentNum > 90) {
-              summary.addRaw(`\n⚠️ **Critical**: Cache usage is still very high (${afterPercent}%). Consider more aggressive cleanup.\n\n`);
-            } else if (afterPercentNum > 75) {
-              summary.addRaw(`\n⚠️ **Warning**: Cache usage is elevated (${afterPercent}%). Monitor closely.\n\n`);
+            if (afterUsagePercentNum > 90) {
+              summary.addRaw(`\n⚠️ **Critical**: Cache usage is still very high (${afterUsagePercent}%). Consider more aggressive cleanup.\n\n`);
+            } else if (afterUsagePercentNum > 75) {
+              summary.addRaw(`\n⚠️ **Warning**: Cache usage is elevated (${afterUsagePercent}%). Monitor closely.\n\n`);
             } else {
-              summary.addRaw(`\n✅ **Healthy**: Cache usage is at a good level (${afterPercent}%).\n\n`);
+              summary.addRaw(`\n✅ **Healthy**: Cache usage is at a good level (${afterUsagePercent}%).\n\n`);
             }
             
             if (dryRun) {
@@ -1301,4 +1314,5 @@ jobs:
             
             await summary.write();
             
-            console.log('\n✅ Final report generated successfully'); 
+            console.log('\n✅ Final report generated successfully');
+            
