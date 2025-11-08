@@ -294,18 +294,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
           compression-level: 6
-      
-      - name: 📤 Upload build metadata
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.model }}-metadata
-          path: |
-            ${{ matrix.model }}/kernel_platform/artifacts/build_info.json
-            ${{ matrix.model }}/kernel_platform/artifacts/*.txt
-          retention-days: 30
-          if-no-files-found: warn
-
+           
       - name: 📝 Job summary
         if: always()
         run: |
@@ -472,22 +461,18 @@ jobs:
           - **Clean Build:** ${CLEAN}
           
           ## 📥 Installation
-          1. **Download** the ZIP file for your device from the assets below
-          2. **Verify** the SHA256 checksum (optional but recommended)
-          3. **Flash** using SukiSU Manager or custom recovery (TWRP/OrangeFox)
+          1. **Download** the ZIP file for your device from the assets below          
+          2. **Flash** using SukiSU Manager or Kernel Flasher. USe SukiSU Manager to enable KPM
           4. **Reboot** your device
           5. **Enjoy** enhanced root capabilities!
           
           ## ⚠️ Important Notes
           - Always backup your data before flashing
-          - Ensure you have a custom recovery installed
-          - Some features may require additional modules
           - Check device compatibility before flashing
           
           ## 🔗 Useful Links
           - [SUSFS Module](https://github.com/sidex15/ksu_module_susfs)
-          - [SukiSU Ultra Manager](https://github.com/SukiSU-Ultra/SukiSU-Ultra)
-          - [Report Issues](https://github.com/${{ github.repository }}/issues)
+          - [SukiSU Ultra Manager](https://github.com/SukiSU-Ultra/SukiSU-Ultra)          
           - [Documentation](https://github.com/${{ github.repository }}/wiki)
           
           ## 📊 Build Information
@@ -505,7 +490,7 @@ jobs:
           
           ---
           
-          **Disclaimer:** This is custom kernel software. Flash at your own risk. The developers are not responsible for any damage to your device.
+          **Disclaimer:** Flash at your own risk. The developers are not responsible for any damage to your device.
           EOF
           
           echo "::endgroup::"
