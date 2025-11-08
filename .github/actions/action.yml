@@ -399,25 +399,31 @@ runs:
         echo ""
         echo "🔍 Verifying structure..."
         
+        # ✅ FIX 1: Check correct paths under kernel_platform
+        KP="kernel_platform"
+        EXPECTED=( "$KP/common" "$KP/prebuilts" "$KP/prebuilts-master" )
         MISSING=()
-        for dir in kernel common prebuilts; do
+        for dir in "${EXPECTED[@]}"; do
           [ ! -d "$dir" ] && MISSING+=("$dir")
         done
         
         if [ ${#MISSING[@]} -gt 0 ]; then
-          echo "  ⚠️  Missing: ${MISSING[*]}"
+          echo "  ⚠️  Missing (under kernel_platform): ${MISSING[*]}"
           echo ""
-          echo "  Available directories:"
+          echo "  Available top-level directories:"
           ls -d */ 2>/dev/null | sed 's|/$||' | sed 's/^/    /' || echo "    (none)"
+          echo ""
+          echo "  kernel_platform layout:"
+          find "$KP" -maxdepth 2 -type d 2>/dev/null | sed 's/^/    /' | head -n 80 || true
           echo ""
           echo "::warning::Some expected directories missing - build may fail"
         else
-          echo "  ✅ All expected directories present"
+          echo "  ✅ kernel_platform layout looks complete"
         fi
         
         echo ""
         echo "📂 Key directories:"
-        for dir in kernel common prebuilts build; do
+        for dir in kernel_platform kernel_platform/common kernel_platform/prebuilts kernel_platform/prebuilts-master; do
           if [ -d "$dir" ]; then
             SIZE=$(du -sh "$dir" 2>/dev/null | cut -f1 || echo "?")
             echo "  ✓ $dir/ ($SIZE)"
@@ -435,7 +441,18 @@ runs:
         CONFIG_DIR="$GITHUB_WORKSPACE/$CONFIG"
         ARTIFACTS_DIR="$CONFIG_DIR/artifacts"
         mkdir -p "$ARTIFACTS_DIR"
-        cd "$CONFIG_DIR/kernel_platform/common"
+        
+        # ✅ FIX 2: Fallback to msm-kernel if common doesn't exist
+        if [ -d "$CONFIG_DIR/kernel_platform/common" ]; then
+          cd "$CONFIG_DIR/kernel_platform/common"
+        elif [ -d "$CONFIG_DIR/kernel_platform/msm-kernel" ]; then
+          cd "$CONFIG_DIR/kernel_platform/msm-kernel"
+        else
+          echo "::error::Neither kernel_platform/common nor kernel_platform/msm-kernel exists"
+          echo "Available in kernel_platform:"
+          find "$CONFIG_DIR/kernel_platform" -maxdepth 2 -type d | sed 's/^/  - /' || true
+          exit 1
+        fi
         
         CONFIG_FILES=("build.config.common" "build.config.constants")
         BRANCH_LINE=""
@@ -506,6 +523,10 @@ runs:
         fi
         $CLANG_FOUND || { echo "::error::No clang toolchain found"; exit 1; }
         echo "CLANG_BIN_PATH=$CLANG_BIN" >> "$GITHUB_ENV"
+        
+        # ✅ FIX 4: Export PATH early for downstream steps
+        echo "PATH=$CLANG_BIN:$PATH" >> "$GITHUB_ENV"
+        
         CLANG_VERSION="$("$CLANG_BIN/clang" --version | head -n1)"
         echo "CLANG_VERSION=$CLANG_VERSION" >> "$GITHUB_ENV"
         echo "✅ Detected Clang: $CLANG_VERSION"
@@ -744,7 +765,8 @@ runs:
         path: |
           ${{ github.workspace }}/${{ env.CONFIG }}/kernel_platform/prebuilts
           ${{ github.workspace }}/${{ env.CONFIG }}/kernel_platform/prebuilts-master
-        key: clang-toolchain-${{ env.OP_SOC }}-${{ env.CLANG_VERSION_SHORT }}-${{ hashFiles(format('{0}/kernel_platform/.repo/**/manifest*.xml', env.CONFIG)) }}
+        # ✅ FIX 3: Correct .repo path for manifest hash
+        key: clang-toolchain-${{ env.OP_SOC }}-${{ env.CLANG_VERSION_SHORT }}-${{ hashFiles(format('{0}/.repo/**/manifest*.xml', env.CONFIG)) }}
         restore-keys: |
           clang-toolchain-${{ env.OP_SOC }}-${{ env.CLANG_VERSION_SHORT }}-
           clang-toolchain-${{ env.OP_SOC }}-
@@ -797,7 +819,6 @@ runs:
           echo ""
           echo "Pre-build statistics:"
           
-          # ✅ FIX D: More resilient stats grep
           ccache -s | grep -Ei "(cache hit|cache miss|cache size|files in cache|evicted|cleanups|cacheable)" | head -n 20 || ccache -s | head -n 20
         else
           echo "⚠️ No existing cache - building from scratch"
@@ -1575,7 +1596,6 @@ runs:
         echo "Timestamp: $KBUILD_BUILD_TIMESTAMP"
         echo "Workspace: $WORKSPACE"
         
-        # ✅ FIX C: Align ccache log with actual configuration
         if [ "${{ inputs.clean }}" != "true" ]; then
           echo "ccache: ENABLED"
           echo "  Dir: $CCACHE_DIR"
@@ -1649,50 +1669,40 @@ runs:
         
         STATS="$(ccache -s)"
         
-        # 🔍 Multi-version compatible parsing
-        # Try modern format first, fall back to legacy labels
-        
-        # Attempt 1: Modern "Cacheable calls:" format
+        # Multi-version compatible parsing
         CACHEABLE=$(echo "$STATS" | awk '/Cacheable calls:/ {
           match($0, /[0-9]+/); 
           print substr($0, RSTART, RLENGTH)
         }' | head -n1)
         
-        # Fallback: Legacy "cache hit" counting
         if [ -z "$CACHEABLE" ] || [ "$CACHEABLE" = "0" ]; then
           TOTAL_HITS=$(echo "$STATS" | grep -i "cache hit" | grep -oE '[0-9]+' | head -n1 || echo "0")
           TOTAL_MISS=$(echo "$STATS" | grep -i "cache miss" | grep -oE '[0-9]+' | head -n1 || echo "0")
           CACHEABLE=$((TOTAL_HITS + TOTAL_MISS))
         fi
         
-        # Attempt 1: Modern "Hits:" format
         HITS=$(echo "$STATS" | awk '/^[[:space:]]*Hits:/ {
           match($0, /[0-9]+/); 
           print substr($0, RSTART, RLENGTH)
         }' | head -n1)
         
-        # Fallback: Legacy "cache hit" total
         if [ -z "$HITS" ]; then
           HITS=$(echo "$STATS" | grep -iE "cache hit|hits" | grep -oE '[0-9]+' | head -n1 || echo "0")
         fi
         
-        # Attempt 1: Modern "Direct:" format
         DIRECT=$(echo "$STATS" | awk '/Direct:/ {
           match($0, /[0-9]+/); 
           print substr($0, RSTART, RLENGTH)
         }' | head -n1)
         
-        # Fallback: Legacy "cache hit (direct)" format
         if [ -z "$DIRECT" ]; then
           DIRECT=$(echo "$STATS" | grep -i "direct" | grep -oE '[0-9]+' | head -n1 || echo "0")
         fi
         
-        # 🛡️ Safety: Ensure numeric values
         CACHEABLE="${CACHEABLE:-0}"
         HITS="${HITS:-0}"
         DIRECT="${DIRECT:-0}"
         
-        # Calculate rates with division-by-zero protection
         if [ "$CACHEABLE" -gt 0 ]; then
           HIT_RATE=$(awk -v h="$HITS" -v c="$CACHEABLE" 'BEGIN{printf "%.1f", (h/c)*100}')
           DIRECT_RATE=$(awk -v d="$DIRECT" -v c="$CACHEABLE" 'BEGIN{printf "%.1f", (d/c)*100}')
@@ -1712,7 +1722,6 @@ runs:
         echo "  Hit rate: ${HIT_RATE}%"
         echo "  Direct rate: ${DIRECT_RATE}%"
         
-        # 🎯 Performance classification
         if (( $(echo "$HIT_RATE > 80" | bc -l 2>/dev/null || echo 0) )); then
           echo "  Status: 🔥 Excellent cache efficiency"
         elif (( $(echo "$HIT_RATE > 50" | bc -l 2>/dev/null || echo 0) )); then
