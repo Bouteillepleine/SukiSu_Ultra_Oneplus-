@@ -504,7 +504,14 @@ runs:
         set -euo pipefail
         echo "::group::Detect Clang"
         KP="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
+        
+        # Initialize to satisfy set -u during this step
+        CLANG_BIN_PATH=""
+        export CLANG_BIN_PATH
+        
         CLANG_FOUND=false
+        CLANG_BIN=""
+        
         for base in "$KP/prebuilts" "$KP/prebuilts-master"; do
           [ -d "$base/clang/host/linux-x86" ] || continue
           latest=$(ls -d "$base"/clang/host/linux-x86/clang-r*/ 2>/dev/null | sort -V | tail -n1 || true)
@@ -514,17 +521,20 @@ runs:
             break
           fi
         done
+        
         if ! $CLANG_FOUND && command -v clang >/dev/null 2>&1; then
           CLANG_BIN="$(dirname "$(command -v clang)")"
           CLANG_FOUND=true
           echo "Using system clang."
         fi
-        $CLANG_FOUND || { echo "::error::No clang toolchain found"; exit 1; }
-        echo "CLANG_BIN_PATH=$CLANG_BIN" >> "$GITHUB_ENV"
         
+        $CLANG_FOUND || { echo "::error::No clang toolchain found"; exit 1; }
+        
+        CLANG_BIN_PATH="$CLANG_BIN"
+        echo "CLANG_BIN_PATH=$CLANG_BIN_PATH" >> "$GITHUB_ENV"
         echo "PATH=${CLANG_BIN_PATH}:$PATH" >> "$GITHUB_ENV"
         
-        CLANG_VERSION="$("$CLANG_BIN/clang" --version | head -n1)"
+        CLANG_VERSION="$("$CLANG_BIN_PATH/clang" --version | head -n1)"
         echo "CLANG_VERSION=$CLANG_VERSION" >> "$GITHUB_ENV"
         echo "✅ Detected Clang: $CLANG_VERSION"
         echo "::endgroup::"
@@ -535,8 +545,8 @@ runs:
         set -euo pipefail
         echo "::group::Normalize clang version"
         
-        if [ -n "${CLANG_BIN_PATH:-}" ]; then
-          toolchain_dir="$(dirname "$CLANG_BIN_PATH")"
+        if [ -n "${CLANG_BIN_PATH:-}" ]; then          
+          toolchain_dir="$(dirname "${CLANG_BIN_PATH}")"
           
           # Expect .../clang-rXXXXX[letter]
           if echo "$toolchain_dir" | grep -qE '/clang-r[0-9]+[a-z]*$'; then
@@ -567,33 +577,87 @@ runs:
         set -euo pipefail
         echo "::group::Configure cache strategy"
         
-        # Stable clang version fingerprint
-        BUILD_CONFIG="${{ github.workspace }}/${{ env.CONFIG }}/kernel_platform/build.config.constants"
+        # ============================================
+        # CRITICAL: Initialize all variables first
+        # ============================================
+        CLANG_VERSION_SHORT="${CLANG_VERSION_SHORT:-}"
+        ANDROID_VER="${ANDROID_VER:-}"
+        KERNEL_VER="${KERNEL_VER:-}"
+        
+        # ============================================
+        # Extract clang version from build.config
+        # ============================================
+        BUILD_CONFIG="${GITHUB_WORKSPACE}/${{ env.CONFIG }}/kernel_platform/common/build.config.constants"
+        
         if [ -f "$BUILD_CONFIG" ]; then
-          CLANG_VERSION=$(grep -oP 'CLANG_VERSION=\K[^"]+' "$BUILD_CONFIG" | head -1)
-          CLANG_VERSION="${CLANG_VERSION#clang-}"
+          echo "Reading clang version from build.config..."
+          
+          # Extract CLANG_VERSION (e.g., "clang-r487747c" or "r487747c")
+          CLANG_FROM_CONFIG=$(grep -oP 'CLANG_VERSION=\K[^"]+' "$BUILD_CONFIG" 2>/dev/null | head -1 || true)
+          
+          if [ -n "$CLANG_FROM_CONFIG" ]; then
+            # Normalize: remove "clang-" prefix if present
+            CLANG_FROM_CONFIG="${CLANG_FROM_CONFIG#clang-}"
+            echo "  Found in config: $CLANG_FROM_CONFIG"
+            
+            # Use config value if CLANG_VERSION_SHORT is still empty
+            if [ -z "$CLANG_VERSION_SHORT" ]; then
+              CLANG_VERSION_SHORT="$CLANG_FROM_CONFIG"
+              echo "  Using config value: $CLANG_VERSION_SHORT"
+            else
+              echo "  Already set to: $CLANG_VERSION_SHORT (keeping existing)"
+            fi
+          else
+            echo "  ⚠️  CLANG_VERSION not found in build.config"
+          fi
         else
-          CLANG_VERSION="r487747c"
+          echo "  ⚠️  build.config.constants not found at: $BUILD_CONFIG"
         fi
         
-        # Only set if not already normalized from detected path
-        if [ -z "${CLANG_VERSION_SHORT:-}" ]; then
-          echo "CLANG_VERSION_SHORT=$CLANG_VERSION" >> "$GITHUB_ENV"
-        else
-          echo "ℹ️ CLANG_VERSION_SHORT already set to: ${CLANG_VERSION_SHORT}"
+        # ============================================
+        # Fallback: Extract from CLANG_BIN_PATH
+        # ============================================
+        if [ -z "$CLANG_VERSION_SHORT" ] && [ -n "${CLANG_BIN_PATH:-}" ]; then
+          echo "Attempting to extract from CLANG_BIN_PATH..."
+          
+          toolchain_dir="$(dirname "${CLANG_BIN_PATH}")"
+          
+          if echo "$toolchain_dir" | grep -qE '/clang-r[0-9]+[a-z]*$'; then
+            detected_short="$(basename "$toolchain_dir" | sed 's/^clang-//')"
+            CLANG_VERSION_SHORT="$detected_short"
+            echo "  Extracted from path: $CLANG_VERSION_SHORT"
+          fi
         fi
         
-        # Single ccache directory
+        # ============================================
+        # Final fallback: Use default
+        # ============================================
+        if [ -z "$CLANG_VERSION_SHORT" ]; then
+          CLANG_VERSION_SHORT="r487747c"
+          echo "  ⚠️  Using default fallback: $CLANG_VERSION_SHORT"
+        fi
+        
+        # ============================================
+        # Export to environment
+        # ============================================
+        echo "CLANG_VERSION_SHORT=$CLANG_VERSION_SHORT" >> "$GITHUB_ENV"
+        
+        # ============================================
+        # Configure ccache
+        # ============================================
         echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
         echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}" >> "$GITHUB_ENV"
         echo "CCACHE_MAXSIZE=3G" >> "$GITHUB_ENV"
         
-        # Device hash (optional - use only if you need per-device isolation)
-        DEVICE_HASH=$(echo -n "${OP_MODEL}-${OP_SOC}" | sha256sum | cut -c1-8)
-        echo "DEVICE_HASH=$DEVICE_HASH" >> "$GITHUB_ENV"
+        # Optional: Device-specific isolation (uncomment if needed)
+        # DEVICE_HASH=$(echo -n "${OP_MODEL}-${OP_SOC}" | sha256sum | cut -c1-8)
+        # echo "DEVICE_HASH=$DEVICE_HASH" >> "$GITHUB_ENV"
         
+        echo ""
         echo "📦 Cache configuration:"
-        echo "  Clang: ${CLANG_VERSION_SHORT:-$CLANG_VERSION}"
+        echo "  Clang version: $CLANG_VERSION_SHORT"
+        echo "  Android: ${ANDROID_VER:-<will be set later>}"
+        echo "  Kernel: ${KERNEL_VER:-<will be set later>}"
         echo "  CCACHE_DIR: $HOME/.ccache"
         echo "  BaseDir: ${GITHUB_WORKSPACE}"
         echo "  Max size: 3G"
@@ -683,32 +747,37 @@ runs:
         set -euo pipefail
         echo "::group::Validate cache configuration"
         
+        # Initialize with defaults to prevent unbound errors
+        ANDROID_VER="${ANDROID_VER:-unknown}"
+        KERNEL_VER="${KERNEL_VER:-unknown}"
+        CLANG_VERSION_SHORT="${CLANG_VERSION_SHORT:-unknown}"
+        
         echo "Checking cache key components..."
         
         VALIDATION_FAILED=false
         
         # Check ANDROID_VER
-        if [ -z "${ANDROID_VER:-}" ] || [ "${ANDROID_VER}" = "unknown" ]; then
-          echo "❌ ANDROID_VER is invalid: '${ANDROID_VER:-<empty>}'"
+        if [ "$ANDROID_VER" = "unknown" ] || [ -z "$ANDROID_VER" ]; then
+          echo "❌ ANDROID_VER is invalid: '$ANDROID_VER'"
           VALIDATION_FAILED=true
         else
-          echo "✅ ANDROID_VER: ${ANDROID_VER}"
+          echo "✅ ANDROID_VER: $ANDROID_VER"
         fi
         
         # Check KERNEL_VER
-        if [ -z "${KERNEL_VER:-}" ] || [ "${KERNEL_VER}" = "unknown" ]; then
-          echo "❌ KERNEL_VER is invalid: '${KERNEL_VER:-<empty>}'"
+        if [ "$KERNEL_VER" = "unknown" ] || [ -z "$KERNEL_VER" ]; then
+          echo "❌ KERNEL_VER is invalid: '$KERNEL_VER'"
           VALIDATION_FAILED=true
         else
-          echo "✅ KERNEL_VER: ${KERNEL_VER}"
+          echo "✅ KERNEL_VER: $KERNEL_VER"
         fi
         
         # Check CLANG_VERSION_SHORT
-        if [ -z "${CLANG_VERSION_SHORT:-}" ] || [ "${CLANG_VERSION_SHORT}" = "unknown" ]; then
-          echo "❌ CLANG_VERSION_SHORT is invalid: '${CLANG_VERSION_SHORT:-<empty>}'"
+        if [ "$CLANG_VERSION_SHORT" = "unknown" ] || [ -z "$CLANG_VERSION_SHORT" ]; then
+          echo "❌ CLANG_VERSION_SHORT is invalid: '$CLANG_VERSION_SHORT'"
           VALIDATION_FAILED=true
         else
-          echo "✅ CLANG_VERSION_SHORT: ${CLANG_VERSION_SHORT}"
+          echo "✅ CLANG_VERSION_SHORT: $CLANG_VERSION_SHORT"
         fi
         
         echo ""
@@ -716,7 +785,6 @@ runs:
         if [ "$VALIDATION_FAILED" = "true" ]; then
           echo "⚠️ Cache key validation failed"
           echo "   Cache will be disabled for this build to prevent pollution"
-          echo "   This usually indicates a version detection issue"
           echo ""
           echo "::warning::Cache disabled due to invalid key components"
           echo "CCACHE_DISABLE=1" >> "$GITHUB_ENV"
