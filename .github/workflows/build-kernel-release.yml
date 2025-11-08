@@ -198,8 +198,13 @@ jobs:
               echo "  - ccache hit rate: ${{ steps.build.outputs.ccache_hit_rate }}"
             fi
             
+            # ✅ NEW: Show errors count
             if [ -n "${{ steps.build.outputs.warnings_count }}" ]; then
               echo "  - Warnings: ${{ steps.build.outputs.warnings_count }}"
+            fi
+            
+            if [ -n "${{ steps.build.outputs.errors_count }}" ]; then
+              echo "  - Errors: ${{ steps.build.outputs.errors_count }}"
             fi
           else
             echo "❌ Build failed"
@@ -207,13 +212,27 @@ jobs:
           
           echo "::endgroup::"
 
+      # ✅ FIX: Use ARTIFACTS_DIR path from action
       - name: 📤 Upload kernel artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.model }}-kernel
-          path: ${{ matrix.model }}/artifacts/${{ steps.build.outputs.zip_name }}
+          path: ${{ matrix.model }}/kernel_platform/artifacts/${{ steps.build.outputs.zip_name }}
           retention-days: 30
+          if-no-files-found: error
+
+      # ✅ NEW: Upload build metadata
+      - name: 📤 Upload build metadata
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.model }}-metadata
+          path: |
+            ${{ matrix.model }}/kernel_platform/artifacts/build_info.json
+            ${{ matrix.model }}/kernel_platform/artifacts/kernel_version.txt
+          retention-days: 30
+          if-no-files-found: warn
 
       - name: 📝 Job summary
         if: always()
@@ -241,6 +260,11 @@ jobs:
             
             if [ -n "${{ steps.build.outputs.warnings_count }}" ]; then
               echo "| **Warnings** | ${{ steps.build.outputs.warnings_count }} |" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            # ✅ NEW: Show errors in summary
+            if [ -n "${{ steps.build.outputs.errors_count }}" ]; then
+              echo "| **Errors** | ${{ steps.build.outputs.errors_count }} |" >> $GITHUB_STEP_SUMMARY
             fi
             
             cat >> $GITHUB_STEP_SUMMARY << EOF
@@ -294,16 +318,30 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: '*-kernel'
+
+      # ✅ NEW: Download metadata artifacts
+      - name: 📥 Download metadata
+        uses: actions/download-artifact@v4
+        with:
+          path: metadata
+          pattern: '*-metadata'
 
       - name: 📦 Prepare release assets
         id: prepare
         run: |
           echo "::group::Prepare release"
           
-          mkdir release
+          mkdir -p release
           find artifacts -name "*.zip" -exec cp {} release/ \;
           
           count=$(ls -1 release/*.zip 2>/dev/null | wc -l)
+          
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No kernel ZIPs found in artifacts"
+            exit 1
+          fi
+          
           total_size=$(du -sb release | cut -f1)
           
           echo "📦 Prepared $count kernel(s)"
@@ -312,43 +350,86 @@ jobs:
           echo "count=$count" >> $GITHUB_OUTPUT
           echo "total_size=$total_size" >> $GITHUB_OUTPUT
           
+          # ✅ IMPROVED: Generate detailed release notes with metadata
           cat > notes.md << 'EOF'
           # 🚀 SukiSU Ultra with SUSFS v1.5.12
           
           ## 📱 Built Devices
+          
           EOF
           
           for zip in release/*.zip; do
             name=$(basename "$zip" .zip)
             size=$(stat -c%s "$zip")
             size_mb=$(echo "scale=2; $size / 1024 / 1024" | bc)
-            echo "- \`$name\` (${size_mb} MB)" >> notes.md
+            sha256=$(sha256sum "$zip" | awk '{print $1}')
+            
+            # Try to extract device info from metadata
+            device_name=$(echo "$name" | sed 's/SukiSU-Ultra-//' | sed 's/-android.*//')
+            
+            cat >> notes.md << DEVICE
+          ### 📦 $device_name
+          - **File:** \`$name.zip\`
+          - **Size:** ${size_mb} MB
+          - **SHA256:** \`${sha256}\`
+          
+          DEVICE
           done
           
           cat >> notes.md << 'EOF'
           
           ## ✨ Features
-          - ⚡ **SukiSU Ultra Manager** - Advanced root management
-          - 🛡️ **SUSFS v1.5.12** - Enhanced security and hiding
-          - 🌐 **WireGuard** - Built-in VPN support
-          - 💾 **ZRAM** - Memory compression (optional)
-          - 🔧 **BBG LSM** - Baseband Guard security (optional)
-          - 🚀 **Optimized Build** - O2/O3 compiler optimizations
+          - ⚡ **SukiSU Ultra Manager** - Advanced root management with enhanced UI
+          - 🛡️ **SUSFS v1.5.12** - Enhanced security and hiding capabilities
+          - 🌐 **WireGuard** - Built-in VPN support for secure connections
+          - 💾 **ZRAM** - Memory compression with LZ4K/LZ4KD (optional)
+          - 🔧 **BBG LSM** - Baseband Guard security module (optional)
+          - 🚀 **Compiler Optimizations** - O2/O3 optimizations with LTO
+          - 🎯 **Multiple Hook Types** - kprobe, manual, or tracepoint
+          
+          ## 🔧 Build Configuration
+          - **Hook Type:** ${{ inputs.hook }}
+          - **Optimization:** ${{ inputs.optimize_level }}
+          - **ZRAM:** ${{ inputs.enable_zram }}
+          - **BBG LSM:** ${{ inputs.lsm }}
+          - **Fengchi Scheduler:** ${{ inputs.sched }}
+          - **Clean Build:** ${{ inputs.clean_build }}
           
           ## 📥 Installation
-          1. Download the ZIP for your device
-          2. Flash with SukiSU Manager or custom recovery
-          3. Reboot and enjoy!
+          1. **Download** the ZIP file for your device from the assets below
+          2. **Verify** the SHA256 checksum (optional but recommended)
+          3. **Flash** using SukiSU Manager or custom recovery (TWRP/OrangeFox)
+          4. **Reboot** your device
+          5. **Enjoy** enhanced root capabilities!
           
-          ## 🔗 Links
+          ## ⚠️ Important Notes
+          - Always backup your data before flashing
+          - Ensure you have a custom recovery installed
+          - Some features may require additional modules
+          - Check device compatibility before flashing
+          
+          ## 🔗 Useful Links
           - [SUSFS Module](https://github.com/sidex15/ksu_module_susfs)
-          - [SukiSU Manager](https://github.com/SukiSU-Ultra/SukiSU-Ultra)
+          - [SukiSU Ultra Manager](https://github.com/SukiSU-Ultra/SukiSU-Ultra)
           - [Report Issues](https://github.com/${{ github.repository }}/issues)
+          - [Documentation](https://github.com/${{ github.repository }}/wiki)
           
-          ## 📊 Build Info
+          ## 📊 Build Information
           - **Built on:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
           - **Workflow:** ${{ github.workflow }}
           - **Run:** [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          - **Commit:** [\`${{ github.sha }}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
+          
+          ## 💝 Support
+          If you find this project useful, please consider:
+          - ⭐ Starring the repository
+          - 🐛 Reporting bugs and issues
+          - 💬 Joining our community discussions
+          - 📢 Sharing with other OnePlus users
+          
+          ---
+          
+          **Disclaimer:** This is custom kernel software. Flash at your own risk. The developers are not responsible for any damage to your device.
           EOF
           
           echo "::endgroup::"
@@ -358,6 +439,12 @@ jobs:
         run: |
           echo "::group::Create release"
           
+          # ✅ FIX: Better error handling for release creation
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "⚠️ Release $TAG already exists, deleting..."
+            gh release delete "$TAG" --yes || true
+          fi
+          
           gh release create "$TAG" \
             --title "🎯 OnePlus Kernels - SukiSU Ultra $TAG" \
             --notes-file notes.md \
@@ -366,6 +453,8 @@ jobs:
           
           echo "✅ Release created: $TAG"
           echo "🔗 URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG"
+          
+          echo "release_url=${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG" >> $GITHUB_OUTPUT
           
           echo "::endgroup::"
 
@@ -378,25 +467,92 @@ jobs:
           
           ## 🎉 Release Created Successfully
           
-          **Tag:** [\`${{ steps.tag.outputs.tag }}\`](${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ steps.tag.outputs.tag }})  
+          **Tag:** [\`${{ steps.tag.outputs.tag }}\`](${{ steps.release.outputs.release_url }})  
           **Kernels:** ${{ steps.prepare.outputs.count }}  
           **Total Size:** $(numfmt --to=iec-i --suffix=B ${{ steps.prepare.outputs.total_size }})
           
-          ### 📦 Assets
+          ### 📦 Released Assets
           EOF
           
           for zip in release/*.zip; do
             name=$(basename "$zip")
             size=$(stat -c%s "$zip")
             size_mb=$(echo "scale=2; $size / 1024 / 1024" | bc)
+            sha256=$(sha256sum "$zip" | awk '{print $1}')
             echo "- \`$name\` (${size_mb} MB)" >> $GITHUB_STEP_SUMMARY
+            echo "  - SHA256: \`${sha256}\`" >> $GITHUB_STEP_SUMMARY
           done
+          
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          
+          ### 🔗 Quick Links
+          - [📦 Release Page](${{ steps.release.outputs.release_url }})
+          - [📊 Workflow Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          - [📝 Commit](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
+          EOF
 
       - name: 🧹 Cleanup on failure
         if: failure()
         run: |
           echo "::group::Cleanup failed release"
+          
+          # Delete remote tag
           git push origin --delete "$TAG" 2>/dev/null || true
+          
+          # Delete local tag
           git tag -d "$TAG" 2>/dev/null || true
+          
+          # Delete release if it was created
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          
           echo "✅ Cleanup completed"
           echo "::endgroup::"
+
+  # ✅ NEW: Post-build cleanup job
+  cleanup:
+    if: always()
+    needs: [build, release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🧹 Clean up old artifacts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const days = 7;
+            const ms = days * 24 * 60 * 60 * 1000;
+            const cutoff = new Date(Date.now() - ms);
+            
+            console.log(`Cleaning artifacts older than ${days} days (before ${cutoff.toISOString()})`);
+            
+            const artifacts = await github.rest.actions.listArtifactsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100
+            });
+            
+            let deleted = 0;
+            for (const artifact of artifacts.data.artifacts) {
+              const createdAt = new Date(artifact.created_at);
+              if (createdAt < cutoff) {
+                console.log(`Deleting: ${artifact.name} (${artifact.created_at})`);
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id
+                });
+                deleted++;
+              }
+            }
+            
+            console.log(`✅ Deleted ${deleted} old artifact(s)`);
+
+      - name: 📊 Cleanup summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          
+          ---
+          
+          ## 🧹 Cleanup Completed
+          
+          Old artifacts (>7 days) have been automatically removed to save storage space.
+          EOF
