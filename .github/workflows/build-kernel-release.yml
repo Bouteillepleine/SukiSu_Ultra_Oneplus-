@@ -352,14 +352,14 @@ jobs:
           echo "::group::Tag generation"
           
           git fetch --tags
-          latest=$(git tag -l "v1.5.12-r*" | sort -V | tail -1)
+          latest=$(git tag -l "Release_r*" | sort -V | tail -1)
           
           if [ -z "$latest" ]; then
-            tag="v1.5.12-r0"
+            tag="Release_r0"
             echo "🆕 Creating initial tag: $tag"
           else
             rev=$(echo $latest | grep -oP 'r\K\d+')
-            tag="v1.5.12-r$((rev + 1))"
+            tag="Release_r$((rev + 1))"
             echo "📈 Incrementing from $latest to $tag"
           fi
           
@@ -374,30 +374,39 @@ jobs:
           echo "✅ Tag created and pushed"
           echo "::endgroup::"
 
-      - name: 📥 Download all artifacts
+      - name: 📥 Download all build artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-          pattern: '*-kernel'
-
-      - name: 📥 Download metadata
-        uses: actions/download-artifact@v4
-        with:
-          path: metadata
-          pattern: '*-metadata'
 
       - name: 📦 Prepare release assets
         id: prepare
         run: |
           echo "::group::Prepare release"
           
+          # Verify artifacts directory exists
+          if [ ! -d "artifacts" ]; then
+            echo "::error::Artifacts directory not found"
+            exit 1
+          fi
+          
+          # Show what was downloaded
+          echo "Downloaded artifacts:"
+          ls -lah artifacts/
+          echo ""
+          
           mkdir -p release
-          find artifacts -name "*.zip" -exec cp {} release/ \;
+          
+          # Find all ZIP files recursively in artifacts directory
+          find artifacts -type f -name "*.zip" -exec cp {} release/ \;
           
           count=$(ls -1 release/*.zip 2>/dev/null | wc -l)
           
           if [ "$count" -eq 0 ]; then
             echo "::error::No kernel ZIPs found in artifacts"
+            echo ""
+            echo "Artifacts directory structure:"
+            find artifacts -type f
             exit 1
           fi
           
@@ -409,7 +418,7 @@ jobs:
           echo "count=$count" >> $GITHUB_OUTPUT
           echo "total_size=$total_size" >> $GITHUB_OUTPUT
           
-          # ✅ FIX: Use environment variables instead of workflow inputs in heredoc
+          # Generate release notes
           HOOK_TYPE="${{ inputs.hook }}"
           OPTIMIZE="${{ inputs.optimize_level }}"
           ZRAM="${{ inputs.enable_zram }}"
@@ -417,20 +426,23 @@ jobs:
           SCHED="${{ inputs.sched }}"
           CLEAN="${{ inputs.clean_build }}"
           
-          cat > notes.md << EOF
+          cat > notes.md << 'EOF'
           # 🚀 SukiSU Ultra with SUSFS v1.5.12
           
           ## 📱 Built Devices
           
           EOF
           
+          # Process each ZIP file
           for zip in release/*.zip; do
             name=$(basename "$zip" .zip)
             size=$(stat -c%s "$zip")
             size_mb=$(echo "scale=2; $size / 1024 / 1024" | bc)
             sha256=$(sha256sum "$zip" | awk '{print $1}')
             
-            device_name=$(echo "$name" | sed 's/SukiSU-Ultra-//' | sed 's/-android.*//')
+            # Extract device name from ZIP filename
+            # Adjust this regex based on your actual ZIP naming pattern
+            device_name=$(echo "$name" | sed -E 's/^AK3_([^_]+)_.*/\1/')
             
             cat >> notes.md << DEVICE
           ### 📦 $device_name
@@ -461,8 +473,9 @@ jobs:
           - **Clean Build:** ${CLEAN}
           
           ## 📥 Installation
-          1. **Download** the ZIP file for your device from the assets below          
-          2. **Flash** using SukiSU Manager or Kernel Flasher. USe SukiSU Manager to enable KPM
+          1. **Download** the ZIP file for your device from the assets below
+          2. **Flash** using SukiSU Manager or Kernel Flasher
+          3. **Use SukiSU Manager to enable KPM**
           4. **Reboot** your device
           5. **Enjoy** enhanced root capabilities!
           
@@ -472,7 +485,7 @@ jobs:
           
           ## 🔗 Useful Links
           - [SUSFS Module](https://github.com/sidex15/ksu_module_susfs)
-          - [SukiSU Ultra Manager](https://github.com/SukiSU-Ultra/SukiSU-Ultra)          
+          - [SukiSU Ultra Manager](https://github.com/SukiSU-Ultra/SukiSU-Ultra)
           - [Documentation](https://github.com/${{ github.repository }}/wiki)
           
           ## 📊 Build Information
