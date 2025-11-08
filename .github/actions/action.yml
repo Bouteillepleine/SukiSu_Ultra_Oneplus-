@@ -70,6 +70,9 @@ outputs:
   warnings_count:
     description: 'Number of compiler warnings'
     value: ${{ steps.collect_stats.outputs.warnings_count }}
+  errors_count:
+    description: 'Number of build errors parsed from log'
+    value: ${{ steps.collect_stats.outputs.errors_count }}
 
 runs:
   using: 'composite'
@@ -80,7 +83,7 @@ runs:
       run: |
         set -euo pipefail
         echo '${{ inputs.op_config_json }}' > /tmp/config.json
-        jq -r 'to_entries[] | "OP_\(.key | ascii_upcase)=\(.value)"' /tmp/config.json >> "$GITHUB_ENV"
+        jq -r 'to_entries[] | "OP_\(.key | ascii_upcase)=\(.value | tostring)"' /tmp/config.json >> "$GITHUB_ENV"
         echo "Parsed config:"
         jq '.' /tmp/config.json
 
@@ -125,6 +128,9 @@ runs:
           O2|O3) ;;
           *) echo "::error::optimize_level must be O2 or O3; got '$optimize'"; exit 1 ;;
         esac
+                
+        echo "CONFIG=$model" >> "$GITHUB_ENV"
+        
         echo "✅ Input validation passed"
         echo "::endgroup::"
 
@@ -137,17 +143,36 @@ runs:
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
           git curl ca-certificates build-essential clang lld flex bison \
           libelf-dev libssl-dev libncurses-dev zlib1g-dev liblz4-tool \
-          libxml2-utils rsync unzip dwarves file python3 ccache jq bc dos2unix
+          libxml2-utils rsync unzip zip dwarves file python3 ccache jq bc dos2unix
         sudo apt-get clean
         echo "✅ Dependencies installed"
+        echo "::endgroup::"
+    
+    - name: Free Disk Space Early
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Free disk space"
+        echo "Before cleanup:"
+        df -h /
+        
+        if command -v docker >/dev/null 2>&1; then
+          docker system prune -af 2>/dev/null || true
+        fi
+        
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost || true
+        sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+        sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+        
+        echo ""
+        echo "After cleanup:"
+        df -h /
         echo "::endgroup::"
 
     - name: Setup Base Environment
       shell: bash
       run: |
         set -euo pipefail
-        CONFIG="$OP_MODEL"
-        echo "CONFIG=$CONFIG" >> "$GITHUB_ENV"
         REPO="/usr/local/bin/repo"
         if [ ! -x "$REPO" ]; then
           curl -s https://storage.googleapis.com/git-repo-downloads/repo -o "$REPO"
@@ -171,13 +196,6 @@ runs:
         echo "CPU:"
         echo "  Cores: $(nproc --all)"
         echo "  Model: $(lscpu | grep 'Model name' | cut -d: -f2 | xargs)"
-        echo ""
-        echo "ccache:"
-        if [ -d "${CCACHE_DIR:-$HOME/.ccache}" ]; then
-          du -sh "${CCACHE_DIR:-$HOME/.ccache}" 2>/dev/null || echo "  Not initialized"
-        else
-          echo "  Not initialized"
-        fi
         echo "::endgroup::"
 
     - name: Initialize and Sync Kernel Source
@@ -205,11 +223,9 @@ runs:
         
         "$REPO" --version
         success=false
-        SYNC_JOBS=$(nproc --all)
-        [ "$SYNC_JOBS" -gt 30 ] && SYNC_JOBS=30
-        
         for i in 1 2 3; do
-          if "$REPO" sync -c --no-clone-bundle --no-tags --optimized-fetch -j"$SYNC_JOBS"; then
+          if "$REPO" sync -c --no-clone-bundle --no-tags --optimized-fetch \
+             -j"$(nproc --all)" --fail-fast; then
             success=true
             break
           fi
@@ -226,8 +242,11 @@ runs:
         set -euo pipefail
         echo "::group::Get kernel version"
         CONFIG_DIR="$GITHUB_WORKSPACE/$CONFIG"
-        ARTIFACTS_DIR="$CONFIG_DIR/artifacts"
+        
+        ARTIFACTS_DIR="$CONFIG_DIR/kernel_platform/artifacts"
         mkdir -p "$ARTIFACTS_DIR"
+        echo "ARTIFACTS_DIR=$ARTIFACTS_DIR" >> "$GITHUB_ENV"
+        
         cd "$CONFIG_DIR/kernel_platform/common"
         
         CONFIG_FILES=("build.config.common" "build.config.constants")
@@ -254,6 +273,8 @@ runs:
         VERSION=$(grep '^VERSION *=' Makefile | awk '{print $3}')
         PATCHLEVEL=$(grep '^PATCHLEVEL *=' Makefile | awk '{print $3}')
         SUBLEVEL=$(grep '^SUBLEVEL *=' Makefile | awk '{print $3}')
+        SUBLEVEL="${SUBLEVEL:-0}"
+        
         FULL_VERSION="$VERSION.$PATCHLEVEL.$SUBLEVEL"
         
         cd "$ARTIFACTS_DIR"
@@ -270,24 +291,7 @@ runs:
         
         echo "✅ Detected: $ANDROID_VERSION-$FULL_VERSION"
         echo "   SUSFS Branch: gki-$ANDROID_VERSION-$VERSION.$PATCHLEVEL"
-        echo "::endgroup::"
-
-    - name: 🏷️ Set Build Identity (Hardcoded)
-      shell: bash
-      run: |
-        set -euo pipefail
-        echo "::group::Set build user/host"
-                
-        BUILD_USER="OnePlus"
-        BUILD_HOST="ubuntu-build"
-        
-        echo "BUILD_USER=$BUILD_USER" >> "$GITHUB_ENV"
-        echo "BUILD_HOST=$BUILD_HOST" >> "$GITHUB_ENV"
-        
-        echo ""
-        echo "✅ Build identity configured:"
-        echo "   User: $BUILD_USER"
-        echo "   Host: $BUILD_HOST"
+        echo "   Artifacts: $ARTIFACTS_DIR"
         echo "::endgroup::"
 
     - name: Detect Clang
@@ -317,28 +321,64 @@ runs:
         echo "CLANG_VERSION=$CLANG_VERSION" >> "$GITHUB_ENV"
         echo "✅ Detected Clang: $CLANG_VERSION"
         echo "::endgroup::"
-
+   
     - name: Derive Clang Short Version
       shell: bash
       run: |
         set -euo pipefail
         echo "::group::Derive Clang fingerprint"
         
-        short="$("${CLANG_BIN_PATH}/clang" --version | sed -n '1s/.*clang-r\([0-9.]\+\).*/\1/p')"
+        short=""
+        
+        toolchain_dir="$(dirname "${CLANG_BIN_PATH}")"
+        if echo "$toolchain_dir" | grep -qE '/clang-r[0-9]+[a-z]?$'; then
+          short="$(basename "$toolchain_dir" | sed 's/^clang-//')"
+          echo "✅ Extracted from path: $short"
+        fi
+        
+        if [ -z "$short" ] && echo "${CLANG_BIN_PATH}" | grep -qE 'clang-r[0-9]+[a-z]?'; then
+          short="$(echo "${CLANG_BIN_PATH}" | grep -oE 'clang-r[0-9]+[a-z]?' | tail -1 | sed 's/^clang-//')"
+          echo "✅ Extracted from bin path: $short"
+        fi
         
         if [ -z "$short" ]; then
-          short="$("${CLANG_BIN_PATH}/clang" --version | sha256sum | cut -c1-8)"
-          echo "⚠️ Could not extract clang-r version, using hash: $short"
-        else
-          echo "✅ Clang version fingerprint: $short"
+          config_file="$GITHUB_WORKSPACE/$CONFIG/kernel_platform/common/build.config.constants"
+          if [ -f "$config_file" ]; then
+            short="$(awk -F= '/^CLANG_VERSION=/{gsub(/^[ "]+|[ "]+$/,"",$2); gsub(/^clang-/,"",$2); print $2; exit}' "$config_file")"
+            if [ -n "$short" ]; then
+              echo "✅ Extracted from build.config.constants: $short"
+            fi
+          fi
         fi
+        
+        if [ -z "$short" ]; then
+          short="$("${CLANG_BIN_PATH}/clang" --version | sed -n '1s/.*clang-r\([0-9]\+[a-z]\?\).*/\1/p')"
+          if [ -n "$short" ]; then
+            echo "✅ Extracted from version string: $short"
+          fi
+        fi
+        
+        if [ -z "$short" ]; then
+          short="r487747c"
+          echo "⚠️ Could not extract version, using default: $short"
+        fi
+        
+        case "$short" in
+          r510928*) short="r510928" ;;
+          r487747*) short="r487747c" ;;
+          r475365*) short="r475365" ;;
+          r450784*) short="r450784d" ;;
+          r445002*) short="r445002" ;;
+          r416183*) short="r416183b" ;;
+        esac
         
         echo "CLANG_VERSION_SHORT=$short" >> "$GITHUB_ENV"
         
         CLANG_FULL_VERSION="$("${CLANG_BIN_PATH}/clang" --version | head -n1)"
         echo "CLANG_FULL_VERSION=$CLANG_FULL_VERSION" >> "$GITHUB_ENV"
         
-        echo "Full Clang version: $CLANG_FULL_VERSION"
+        echo "📌 Final Clang fingerprint: $short"
+        echo "   Full version: $CLANG_FULL_VERSION"
         echo "::endgroup::"
 
     - name: Validate Clang Path
@@ -360,158 +400,86 @@ runs:
         echo "✅ Clang toolchain validated"
         echo "   Path: ${CLANG_BIN_PATH}"
         echo "   Version: ${CLANG_VERSION}"
+        echo "   Fingerprint: ${CLANG_VERSION_SHORT}"
         echo "::endgroup::"
-
-    - name: Set Cache Environment
+       
+    - name: Setup ccache
       shell: bash
       run: |
         set -euo pipefail
-        echo "::group::Configure ccache environment"
-           
+        echo "::group::Setup ccache"
+        
         CACHE_DIR="$HOME/.ccache"
         mkdir -p "$CACHE_DIR"
-                
-        export CCACHE_DIR="$CACHE_DIR"
-        export CCACHE_MAXSIZE=500M  
-            
-        # Persist to GITHUB_ENV
-        echo "CCACHE_DIR=$CACHE_DIR" >> "$GITHUB_ENV"
-        echo "CCACHE_MAXSIZE=500M" >> "$GITHUB_ENV"   
-            
-        echo "Cache configuration:"
-        echo "  Directory: $CACHE_DIR"
-        echo "  Max size: 500M"  # 
-        echo "  Kernel: ${ANDROID_VER:-unknown}-${KERNEL_VER:-unknown}"
-        echo "  Devices sharing this cache: All ${ANDROID_VER:-unknown}-${KERNEL_VER:-unknown} devices"
-        echo "  Clang: ${CLANG_VERSION_SHORT:-unknown}"
-        echo "  Device: ${OP_MODEL:-unknown} (for logging only)"
-        echo "::endgroup::"       
-
-    - name: ♻️ Setup ccache
-      uses: actions/cache@v4
-      if: ${{ inputs.clean != 'true' }}
-      with:
-        path: ${{ env.CCACHE_DIR }}
-        # ✅ FIXED: Simplified v4 format that matches analysis script
-        key: ccache-suki-v4-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.ANDROID_VER }}-${{ env.KERNEL_VER }}-${{ env.CLANG_VERSION_SHORT }}
-        restore-keys: |
-          ccache-suki-v4-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.ANDROID_VER }}-${{ env.KERNEL_VER }}-
-          ccache-suki-v4-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-
-          ccache-suki-v4-${{ env.ANDROID_VER }}-${{ env.KERNEL_VER }}-
-   
-    - name: ⚡ Configure ccache
-      if: ${{ inputs.clean != 'true' }}
-      shell: bash
-      run: |
-        set -euo pipefail
-        echo "::group::Configure ccache for maximum performance"
         
-        export CCACHE_DIR="$HOME/.ccache"
-        
-        # Show ccache version for debugging
-        echo "ccache version:"
-        ccache --version
-        echo ""
-        
-        # Set max size
-        ccache --max-size=500M
-        
-        # Zero stats when not a clean build
-        if [ "${{ inputs.clean }}" != "true" ]; then
-          ccache --zero-stats
-          echo "✅ ccache statistics reset for this build"
-        fi
-        
-        # Core environment variables
-        export CCACHE_COMPILERCHECK="content"
-        export CCACHE_BASEDIR="${GITHUB_WORKSPACE}"
-        export CCACHE_NOHASHDIR="true"
-        export CCACHE_LOGFILE="$CCACHE_DIR/ccache.log"
-        
-        # Performance tunings (non-fatal)
-        ccache --set-config compression=true || true
-        ccache --set-config compression_level=3 || true
-        ccache --set-config direct_mode=true || true
-        ccache --set-config hash_dir=false || true
-        ccache --set-config file_clone=true || true
-        ccache --set-config inode_cache=true || true
-        ccache --set-config umask=002 || true
-        
-        # Enable depend_mode if available
-        if ccache --help 2>&1 | grep -q 'depend_mode'; then
-          ccache --set-config depend_mode=true || true
-          echo "✅ depend_mode enabled"
-        fi
-        
-        # Log size limiting (version-aware, non-fatal)
-        if ccache --help 2>&1 | grep -q 'max_log_size'; then
-          ccache --set-config max_log_size=1048576 || true
-          echo "✅ max_log_size set to 1MB"
-        elif ccache --help 2>&1 | grep -q 'log_file_max_size'; then
-          ccache --set-config log_file_max_size=1M || true
-          echo "✅ log_file_max_size set to 1MB"
-        else
-          echo "ℹ️ $(ccache --version | head -n1): log size limiting not supported, skipping"
-        fi
-        
-        # Sloppiness for better cache hits (non-fatal)
-        ccache --set-config sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime,pch_defines,system_headers,locale || true
-        
-        # Persist environment variables
         {
-          echo "CCACHE_DIR=$CCACHE_DIR"
-          echo "CCACHE_COMPILERCHECK=content"
+          echo "CCACHE_DIR=$CACHE_DIR"
+          echo "CCACHE_MAXSIZE=500M"
           echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}"
+          echo "CCACHE_COMPILERCHECK=content"
           echo "CCACHE_NOHASHDIR=true"
           echo "CCACHE_IGNOREOPTIONS=--sysroot*"
-          echo "CCACHE_LOGFILE=$CCACHE_LOGFILE"
         } >> "$GITHUB_ENV"
         
-        echo ""
-        echo "✅ ccache configured for production"
-        echo ""
-        echo "Configuration summary:"
-        echo "  Max size: 1G"
-        echo "  Base dir: ${GITHUB_WORKSPACE}"
-        echo "  Compression: zstd level 3"
-        echo "  Direct mode: enabled"
-        echo "  File cloning: enabled"
-        echo "  Inode cache: enabled"
-        echo "  Log file: $CCACHE_LOGFILE"
-        echo "  Sharing strategy: Kernel version (${ANDROID_VER:-unknown}-${KERNEL_VER:-unknown})"
-        echo ""
+        ccache -M 3G
+        ccache -o compression=true
+        ccache -o compression_level=6
+        ccache -o direct_mode=true
+        ccache -o hash_dir=false
+        ccache -o file_clone=true || true
+        ccache -o inode_cache=true || true
+        ccache -o umask=002
+        ccache -o sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime,pch_defines,system_headers,locale
         
-        # Show active configuration
-        echo "Active ccache configuration:"
-        LC_ALL=C ccache --show-config | grep -E "(max_size|compression|compression_level|direct_mode|file_clone|inode_cache|depend_mode|sloppiness|max_log_size|log_file_max_size|umask)" || true
-        echo ""
-        
-        # Check for existing cache
-        if [ -d "$CCACHE_DIR" ] && find "$CCACHE_DIR" -type f -print -quit 2>/dev/null | grep -q .; then
-          echo "✅ Restored shared cache found"
-          echo "   This cache is shared by all ${ANDROID_VER:-unknown}-${KERNEL_VER:-unknown} devices"
-          echo ""
-          echo "Pre-build cache statistics:"
-          ccache --show-stats | head -n 25 || true
-        else
-          echo "⚠️ No existing cache - building from scratch"
-          echo "   Cache will be populated for all ${ANDROID_VER:-unknown}-${KERNEL_VER:-unknown} devices"
+        if ccache --help 2>&1 | grep -q 'depend_mode'; then
+          ccache -o depend_mode=true
         fi
         
+        if [ "${{ inputs.clean }}" = "true" ]; then
+          echo "CCACHE_DISABLE=1" >> "$GITHUB_ENV"
+          echo "⚠️ Clean build mode - ccache disabled"
+        else
+          echo "✅ ccache enabled (3G max)"
+        fi
+        
+        echo ""
+        echo "Cache configuration:"
+        echo "  Directory: $CACHE_DIR"
+        echo "  Max size: 500M"
+        echo "  Model: ${OP_MODEL}"
+        echo "  Android: ${ANDROID_VER}"
+        echo "  Kernel: ${KERNEL_FULL_VER}"
+        echo "  Clang: ${CLANG_VERSION_SHORT}"
         echo "::endgroup::"
 
-    - name: Handle Clean Build Option
-      if: ${{ inputs.clean == 'true' }}
+    - name: Cache ccache
+      uses: actions/cache@v4
+      with:
+        path: ${{ env.CCACHE_DIR }}
+        key: ccache-suki-v4-${{ env.OP_MODEL }}-${{ env.ANDROID_VER }}-${{ env.KERNEL_FULL_VER }}-${{ env.CLANG_VERSION_SHORT }}
+        restore-keys: |
+          ccache-suki-v4-${{ env.OP_MODEL }}-${{ env.ANDROID_VER }}-${{ env.KERNEL_FULL_VER }}-
+          ccache-suki-v4-${{ env.OP_MODEL }}-${{ env.ANDROID_VER }}-
+          ccache-suki-v4-${{ env.OP_MODEL }}-
+
+    - name: Verify ccache
+      if: ${{ inputs.clean != 'true' }}
       shell: bash
       run: |
         set -euo pipefail
-        echo "::group::Clean build requested"
-        echo "⚠️ Clean build mode enabled - ccache will be bypassed"
+        echo "::group::Verify ccache"
         
-        echo "CCACHE_DISABLE=1" >> "$GITHUB_ENV"
+        if [ -d "$CCACHE_DIR" ] && find "$CCACHE_DIR" -type f -print -quit 2>/dev/null | grep -q .; then
+          echo "✅ Cache restored successfully"
+          echo ""
+          ccache -s | head -n 20
+          echo ""
+          echo "Cache size: $(du -sh "$CCACHE_DIR" 2>/dev/null | cut -f1)"
+        else
+          echo "ℹ️ No cache restored - cold build"
+          echo "Cache will be populated for future builds"
+        fi
         
-        echo "✅ ccache disabled for clean build (no cache/stat wipe)"
-        echo "   Shared cache and statistics preserved for concurrent jobs"
         echo "::endgroup::"
 
     - name: Clone AnyKernel3
@@ -622,8 +590,6 @@ runs:
     
         echo "Determining KSU API version..."
         KSU_API_VERSION=$(curl -fsSL --retry 3 --connect-timeout 30 \
-          -H "Authorization: Bearer $GITHUB_TOKEN" \
-          -H "Accept: application/vnd.github+json" \
           "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/$BRANCH_NAME/kernel/Makefile" 2>/dev/null | \
           grep -m1 "KSU_VERSION_API :=" | awk -F'= ' '{print $2}' | tr -d '[:space:]' || true)
         
@@ -1218,14 +1184,12 @@ runs:
         
         export SOURCE_DATE_EPOCH=$COMMIT_TIMESTAMP
         export KBUILD_BUILD_TIMESTAMP="$COMMIT_DATE UTC"
-        export KBUILD_BUILD_USER="${BUILD_USER:-builder}"
-        export KBUILD_BUILD_HOST="${BUILD_HOST:-github-actions}"
+        export KBUILD_BUILD_USER="builder"
+        export KBUILD_BUILD_HOST="github-actions"
         export KBUILD_BUILD_VERSION=1
         
         echo "📅 Build timestamp: $KBUILD_BUILD_TIMESTAMP (from commit $COMMIT_HASH)"
         echo "🔢 SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH"
-        echo "👤 Build user: $KBUILD_BUILD_USER"
-        echo "🖥️  Build host: $KBUILD_BUILD_HOST"
         
         export PATH="/usr/lib/ccache:${CLANG_BIN_PATH}:${PATH}"
         
@@ -1263,71 +1227,19 @@ runs:
         echo "🔍 Compiler & ccache Verification"
         echo "============================================"
         echo "PATH: ${PATH:0:200}..."
+        echo "which clang: $(which clang)"
+        echo "CC: $CC"
+        echo "CCACHE_BASEDIR: ${CCACHE_BASEDIR}"
         echo ""
         
         if [ "${{ inputs.clean }}" != "true" ]; then
-          echo "🔧 Verifying ccache setup:"
-          echo "  which ccache: $(which ccache 2>/dev/null || echo 'not found')"
-          echo "  which clang: $(which clang)"
+          echo "ccache configuration:"
+          ccache -p | grep -E "(compression|direct_mode|depend|sloppiness)" || true
           echo ""
-          
-          # Test if ccache wrapper is active
-          echo "Testing ccache wrapper:"
-          if command -v ccache >/dev/null 2>&1; then
-            # Check if clang is actually wrapped by ccache
-            CLANG_REAL=$(readlink -f "$(which clang)" 2>/dev/null || which clang)
-            CCACHE_PATH=$(which  ccache 2>/dev/null || echo "")
-            
-            if [ -n "$CCACHE_PATH" ] && echo "$PATH" | grep -q "/usr/lib/ccache"; then
-              echo "  ✅ ccache is in PATH before clang"
-              
-              # Verify by running a test compilation
-              echo "  Testing actual ccache usage..."
-              echo "int main() { return 0; }" > /tmp/test.c
-              if clang -c /tmp/test.c -o /tmp/test.o 2>&1 | grep -q ccache; then
-                echo "  ✅ ccache wrapper is ACTIVE"
-              else
-                # Silent test - check ccache stats change
-                BEFORE_CALLS=$(ccache -s | grep -i "cache hit" | grep -oE '[0-9]+' | head -n1 || echo "0")
-                clang -c /tmp/test.c -o /tmp/test.o >/dev/null 2>&1
-                AFTER_CALLS=$(ccache -s | grep -i "cache hit" | grep -oE '[0-9]+' | head -n1 || echo "0")
-                
-                if [ "$AFTER_CALLS" != "$BEFORE_CALLS" ] || [ -f "$CCACHE_DIR/tmp/test.o" ]; then
-                  echo "  ✅ ccache wrapper is ACTIVE (verified by stats)"
-                else
-                  echo "  ⚠️  ccache wrapper status unclear"
-                fi
-              fi
-              rm -f /tmp/test.c /tmp/test.o
-            else
-              echo "  ⚠️  ccache may not be properly configured in PATH"
-            fi
-          else
-            echo "  ⚠️  ccache command not found"
-          fi
-          
-          echo ""
-          echo "Environment variables:"
-          echo "  CC: $CC"
-          echo "  CXX: $CXX"
-          echo "  CCACHE_DIR: ${CCACHE_DIR:-not set}"
-          echo "  CCACHE_BASEDIR: ${CCACHE_BASEDIR:-not set}"
-          echo "  CCACHE_DISABLE: ${CCACHE_DISABLE:-not set}"
-          echo ""
-          
-          echo "Active ccache configuration:"
-          ccache --show-config | grep -E "(max_size|compression|direct_mode|file_clone|inode_cache|depend_mode|sloppiness)" || true
-          echo ""
-          
-          echo "Pre-build ccache statistics:"
-          ccache --show-stats | head -n 25
-        else
-          echo "⚠️ Clean build - ccache bypassed"
-          echo "  CC: $CC"
-          echo "  CXX: $CXX"
+          echo "ccache pre-build status:"
+          ccache -s | head -n 20
         fi
         echo "============================================"
-        echo ""
         
         make O="$OUT" gki_defconfig
         
@@ -1351,67 +1263,38 @@ runs:
         scripts/config --file "$OUT/.config" -e LTO_CLANG
         make O="$OUT" olddefconfig
         
-        # ✨ UPDATED: Add -fdebug-compilation-dir=. for better ccache hits
-        KCFLAGS="$KCFLAGS -Wno-error -pipe -fno-stack-protector -fdebug-compilation-dir=. ${KCFLAGS_EXTRA}"
+        KCFLAGS="$KCFLAGS -Wno-error -pipe -fno-stack-protector ${KCFLAGS_EXTRA}"
         KCPPFLAGS="$KCPPFLAGS -DCONFIG_OPTIMIZE_INLINING"
-
-        # ✨ UPDATED: Cap parallel jobs to reduce throttling on shared runners
-        JOBS=$(nproc --all)
-        [ "$JOBS" -gt 32 ] && JOBS=32
-        echo "🔧 Using $JOBS parallel jobs for build"
-
-        export CC="clang"
-        export CXX="clang++"
-        export HOSTCC="clang"
-        export HOSTCXX="clang++"
-        export HOSTLD="ld.lld"
-        export HOSTAR="llvm-ar"
         
         echo "============================================"
         echo "🔧 Build Configuration"
         echo "============================================"
         echo "Device: ${OP_MODEL}"
         echo "Kernel: ${KERNEL_FULL_VER}"
-        echo "Threads: $JOBS"
+        echo "Threads: $(nproc --all)"
         echo "Optimization: ${{ inputs.optimize_level }}"
-        echo "KCFLAGS: ${KCFLAGS:0:150}..."
-        echo "KCPPFLAGS: ${KCPPFLAGS:0:150}..."
         echo "Timestamp: $KBUILD_BUILD_TIMESTAMP"
-        echo "Workspace: $WORKSPACE"
         
         if [ "${{ inputs.clean }}" != "true" ]; then
-          echo ""
-          echo "ccache: ENABLED"
-          echo "  Directory: $CCACHE_DIR"
-          echo "  Base dir: $CCACHE_BASEDIR"
-          echo "  Max size: $CCACHE_MAXSIZE"
-          echo "  Compression: zstd level 3"
-          echo "  Features: direct_mode, file_clone, inode_cache, depend_mode"
+          echo "ccache: ENABLED (500M max)"
         else
-          echo ""
-          echo "ccache: DISABLED (clean build)"
+          echo "ccache: DISABLED"
         fi
         echo "============================================"
-        echo ""
-        
-        if [ "${{ inputs.clean }}" != "true" ]; then
-          if [ ! -d "$CCACHE_DIR" ] || [ -z "$(find "$CCACHE_DIR" -type f 2>/dev/null | head -n1)" ]; then
-            echo "🔥 Priming cache with header preprocessing..."
-            # ✨ UPDATED: Export KBUILD_OUTPUT for subprocess consistency
-            export KBUILD_OUTPUT="$OUT"
-            make -C "$COMMON" O="$OUT" headers_install prepare 2>&1 | head -n 20 || true
-            echo ""
-          fi
-        fi
         
         BUILD_START=$(date +%s)
         set -o pipefail
         
-        echo "🚀 Starting kernel compilation..."
-        echo ""
+        make -j"$(nproc --all)" O="$OUT" KCFLAGS="$KCFLAGS" KCPPFLAGS="$KCPPFLAGS" 2>&1 | tee build.log
         
-        # ✨ UPDATED: Use $JOBS instead of $(nproc --all)
-        make -j"$JOBS" O="$OUT" KCFLAGS="$KCFLAGS" KCPPFLAGS="$KCPPFLAGS" 2>&1 | tee build.log
+        if [ -f build.log ]; then
+          LOG_SIZE=$(stat -c%s build.log)
+          if [ "$LOG_SIZE" -gt 8388608 ]; then
+            echo "⚠️ Build log is ${LOG_SIZE} bytes, trimming to last 8MB..."
+            tail -c 8388608 build.log > build.last8m.log
+            mv build.last8m.log build.log
+          fi
+        fi
         
         BUILD_END=$(date +%s)
         BUILD_TIME=$((BUILD_END - BUILD_START))
@@ -1431,7 +1314,6 @@ runs:
         
         IMG_SIZE=$(stat -c%s "$IMG")
         
-        echo ""
         echo "============================================"
         echo "✅ Build Completed Successfully"
         echo "============================================"
@@ -1442,429 +1324,166 @@ runs:
           echo ""
           echo "📊 ccache Post-Build Statistics"
           echo "============================================"
-          ccache --show-stats
+          ccache -s
         fi
         echo "============================================"
         echo "::endgroup::"
 
-    - name: 🔍 ccache Debug Log
-      if: ${{ always() && inputs.clean != 'true' }}
-      shell: bash
-      run: |
-        set -euo pipefail
-        echo "::group::ccache debug log (last 100 lines)"
-        
-        LOGFILE="${CCACHE_LOGFILE:-$HOME/.ccache/ccache.log}"
-        
-        if [ -f "$LOGFILE" ]; then
-          echo "📋 Last 100 lines of ccache activity:"
-          tail -n 100 "$LOGFILE" || true
-        else
-          echo "⚠️ No ccache log file found at: $LOGFILE"
-        fi
-        
-        echo "::endgroup::"
-
-    - name: 📊 ccache Post-Build Statistics
+    - name: ccache Statistics
       id: ccache_stats
       if: ${{ always() && inputs.clean != 'true' }}
       shell: bash
       run: |
         set -euo pipefail
-        echo "::group::ccache final statistics"
+        echo "::group::ccache statistics"
         
-        export CCACHE_DIR="${{ env.CCACHE_DIR }}"
-        
-        echo "ccache Statistics"
-        echo "================="
-        
-        # ✨ UPDATED: Add LC_ALL=C for locale-stable stats parsing
-        if ! STATS="$(LC_ALL=C ccache --show-stats 2>&1)"; then
-          echo "⚠️ ccache --show-stats failed"
-          echo "hit_rate=0.0" >> "$GITHUB_OUTPUT"
-          echo "direct_rate=0.0" >> "$GITHUB_OUTPUT"
-          echo "::endgroup::"
-          exit 0
-        fi
-        
+        # ✅ Capture stats ONCE to avoid non-deterministic output
+        STATS="$(ccache -s)"
         echo "$STATS"
         
-        if [ -z "$STATS" ]; then
-          echo "⚠️ Could not retrieve ccache statistics"
-          echo "hit_rate=0.0" >> "$GITHUB_OUTPUT"
-          echo "direct_rate=0.0" >> "$GITHUB_OUTPUT"
-          echo "::endgroup::"
-          exit 0
-        fi
+        # Parse metrics from captured output
+        CACHEABLE=$(echo "$STATS" | awk '/Cacheable calls:/ {match($0, /[0-9]+/); print substr($0, RSTART, RLENGTH)}' | head -n1)
+        HITS=$(echo "$STATS" | awk '/^[[:space:]]*Hits:/ {match($0, /[0-9]+/); print substr($0, RSTART, RLENGTH)}' | head -n1)
+        DIRECT=$(echo "$STATS" | awk '/Direct:/ {match($0, /[0-9]+/); print substr($0, RSTART, RLENGTH)}' | head -n1)
         
-        echo ""
-        echo "Parsing statistics..."
-        
-        # Extract cacheable calls - try multiple patterns
-        CACHEABLE=$(echo "$STATS" | grep -iE "Cacheable calls:" | grep -oE '[0-9]+' | head -n1 || echo "0")
-        CACHEABLE=${CACHEABLE:-0}
-        
-        # Extract hits - look for "Hits:" line under "Cacheable calls"
-        HITS=$(echo "$STATS" | awk '/Cacheable calls:/,/Misses:/ {if (/Hits:/) print}' | grep -oE '[0-9]+' | head -n1 || echo "0")
-        HITS=${HITS:-0}
-        
-        # Extract direct hits - look for "Direct:" line
-        DIRECT=$(echo "$STATS" | grep -E "^\s+Direct:" | grep -oE '[0-9]+' | head -n1 || echo "0")
-        DIRECT=${DIRECT:-0}
-        
-        # Extract preprocessed hits
-        PREPROCESSED=$(echo "$STATS" | grep -E "^\s+Preprocessed:" | grep -oE '[0-9]+' | head -n1 || echo "0")
-        PREPROCESSED=${PREPROCESSED:-0}
-        
-        # Verify hits = direct + preprocessed
-        CALCULATED_HITS=$((DIRECT + PREPROCESSED))
-        if [ "$HITS" -eq 0 ] && [ "$CALCULATED_HITS" -gt 0 ]; then
-          HITS=$CALCULATED_HITS
-        fi
-        
-        echo ""
-        echo "Extracted values:"
-        echo "  Cacheable calls: $CACHEABLE"
-        echo "  Total hits: $HITS"
-        echo "  Direct hits: $DIRECT"
-        echo "  Preprocessed hits: $PREPROCESSED"
-        
-        # Calculate rates safely
-        if [ "$CACHEABLE" -gt 0 ]; then
-          HIT_RATE=$(awk -v h="$HITS" -v c="$CACHEABLE" 'BEGIN{printf "%.1f", (h/c)*100}' 2>/dev/null || echo "0.0")
-          DIRECT_RATE=$(awk -v d="$DIRECT" -v c="$CACHEABLE" 'BEGIN{printf "%.1f", (d/c)*100}' 2>/dev/null || echo "0.0")
+        # Calculate rates with defaults
+        if [ "${CACHEABLE:-0}" -gt 0 ]; then
+          HIT_RATE=$(awk -v h="${HITS:-0}" -v c="$CACHEABLE" 'BEGIN{printf "%.1f", (h/c)*100}')
+          DIRECT_RATE=$(awk -v d="${DIRECT:-0}" -v c="$CACHEABLE" 'BEGIN{printf "%.1f", (d/c)*100}')
         else
           HIT_RATE="0.0"
           DIRECT_RATE="0.0"
         fi
         
-        # Validate rates are numbers and within 0-100 range
-        if ! echo "$HIT_RATE" | grep -qE '^[0-9]+\.?[0-9]*$'; then
-          echo "⚠️ Invalid hit rate format: $HIT_RATE, resetting to 0.0"
-          HIT_RATE="0.0"
-        elif [ "$(echo "$HIT_RATE" | awk '{print ($1 > 100)}')" = "1" ]; then
-          echo "⚠️ Hit rate exceeds 100%: $HIT_RATE, capping at 100.0"
-          HIT_RATE="100.0"
-        fi
-        
-        if ! echo "$DIRECT_RATE" | grep -qE '^[0-9]+\.?[0-9]*$'; then
-          echo "⚠️ Invalid direct rate format: $DIRECT_RATE, resetting to 0.0"
-          DIRECT_RATE="0.0"
-        elif [ "$(echo "$DIRECT_RATE" | awk '{print ($1 > 100)}')" = "1" ]; then
-          echo "⚠️ Direct rate exceeds 100%: $DIRECT_RATE, capping at 100.0"
-          DIRECT_RATE="100.0"
-        fi
-        
-        # Output values (no % symbol)
-        echo "hit_rate=$HIT_RATE" >> "$GITHUB_OUTPUT"
-        echo "direct_rate=$DIRECT_RATE" >> "$GITHUB_OUTPUT"
-        
-        echo ""
-        echo "Final calculated rates:"
-        echo "  Hit rate: ${HIT_RATE}% (${HITS}/${CACHEABLE})"
-        echo "  Direct rate: ${DIRECT_RATE}% (${DIRECT}/${CACHEABLE})"
-        
-        echo "::endgroup::"
-        
-        # Add to step summary
+        # ✅ ONLY write to $GITHUB_OUTPUT here (grouped, single block)
         {
-          echo "## 📊 ccache Statistics"
-          echo ""
-          echo "| Metric | Value | Percentage |"
-          echo "|--------|-------|------------|"
-          echo "| **Hit Rate** | ${HITS}/${CACHEABLE} | **${HIT_RATE}%** |"
-          echo "| **Direct Rate** | ${DIRECT}/${CACHEABLE} | **${DIRECT_RATE}%** |"
-          echo "| Direct Hits | ${DIRECT}/${HITS} | $(awk -v d="$DIRECT" -v h="$HITS" 'BEGIN{if(h>0) printf "%.1f", (d/h)*100; else print "0.0"}')% |"
-          echo "| Preprocessed Hits | ${PREPROCESSED}/${HITS} | $(awk -v p="$PREPROCESSED" -v h="$HITS" 'BEGIN{if(h>0) printf "%.1f", (p/h)*100; else print "0.0"}')% |"
-          echo ""
-          echo "<details>"
-          echo "<summary>Full Statistics</summary>"
-          echo ""
-          echo '```'
-          echo "$STATS"
-          echo '```'
-          echo ""
-          echo "</details>"
-        } >> $GITHUB_STEP_SUMMARY
-
-    - name: Check Disk Space (Post-Build)
-      if: always()
-      shell: bash
-      run: |
-        echo "::group::Disk space report"
-        df -h
+          echo "hit_rate=${HIT_RATE}%"
+          echo "direct_rate=${DIRECT_RATE}%"
+        } >> "$GITHUB_OUTPUT"
+        
+        # ✅ Display to stdout ONLY (no redirection)
         echo ""
-        echo "Largest directories in workspace:"
-        du -h --max-depth=2 "$GITHUB_WORKSPACE" 2>/dev/null | sort -rh | head -n 20 || true
-        echo "::endgroup::"
-
-    - name: On failure - Summarize last error
-      if: ${{ failure() }}
-      shell: bash
-      run: |
-        set +e
-        echo "::group::Build Failure Analysis"
-        COMMON="$GITHUB_WORKSPACE/$CONFIG/kernel_platform/common"
+        echo "📊 Cache Performance:"
+        echo "   Hit Rate: ${HIT_RATE}%"
+        echo "   Direct Rate: ${DIRECT_RATE}%"
         
-        echo "## 🔴 Build Failed - Last 120 Lines" >> "$GITHUB_STEP_SUMMARY"
-        echo "" >> "$GITHUB_STEP_SUMMARY"
-        echo '```' >> "$GITHUB_STEP_SUMMARY"
-        
-        if [ -f "$COMMON/build.log" ]; then
-          tail -n 120 "$COMMON/build.log" >> "$GITHUB_STEP_SUMMARY"
-        else
-          echo "build.log not available" >> "$GITHUB_STEP_SUMMARY"
-        fi
-        
-        echo '```' >> "$GITHUB_STEP_SUMMARY"
-        echo "::endgroup::"
-   
-    - name: Save Build Metadata
-      id: save_metadata
-      shell: bash
-      run: |
-        set -euo pipefail
-        echo "::group::Save Build Metadata"
-        
-        CONFIG_DIR="$GITHUB_WORKSPACE/$CONFIG"
-        ARTIFACTS_DIR="$CONFIG_DIR/artifacts"
-        mkdir -p "$ARTIFACTS_DIR"
-        
-        KERNEL_VERSION="${KERNEL_FULL_VER:-}"
-        SUKISU_VERSION="${SUKISUVER:-}"
-        SUSFS_VERSION="${SUSVER:-}"
-        
-        if [ -z "$KERNEL_VERSION" ] && [ -f "$ARTIFACTS_DIR/kernel_version.txt" ]; then
-          KERNEL_VERSION=$(cat "$ARTIFACTS_DIR/kernel_version.txt")
-        fi
-        
-        if [ -z "$SUKISU_VERSION" ]; then
-          KSU_DIR="$CONFIG_DIR/kernel_platform/KernelSU"
-          if [ -d "$KSU_DIR" ]; then
-            cd "$KSU_DIR"
-            for b in main master susfs-main; do
-              if git show-ref --verify --quiet "refs/heads/$b" 2>/dev/null || \
-                 git show-ref --verify --quiet "refs/remotes/origin/$b" 2>/dev/null; then
-                commit_count=$(git rev-list --count "$b" 2>/dev/null || echo 13000)
-                SUKISU_VERSION=$((commit_count + 10700))
-                break
-              fi
-            done
-          fi
-        fi
-        
-        if [ -z "$SUSFS_VERSION" ]; then
-          SUSFS_HEADER="$CONFIG_DIR/kernel_platform/common/include/linux/susfs.h"
-          if [ -f "$SUSFS_HEADER" ]; then
-            SUSFS_VERSION=$(grep '#define SUSFS_VERSION' "$SUSFS_HEADER" | awk -F'"' '{print $2}')
-          fi
-        fi
-        
-        KERNEL_VERSION="${KERNEL_VERSION:-unknown}"
-        SUKISU_VERSION="${SUKISU_VERSION:-unknown}"
-        SUSFS_VERSION="${SUSFS_VERSION:-unknown}"
-        
-        echo "kernel_version=${KERNEL_VERSION}" >> "$GITHUB_OUTPUT"
-        echo "sukisu_version=${SUKISU_VERSION}" >> "$GITHUB_OUTPUT"
-        echo "susfs_version=${SUSFS_VERSION}" >> "$GITHUB_OUTPUT"
-        
-        echo "KERNEL_VERSION=${KERNEL_VERSION}" >> "$GITHUB_ENV"
-        echo "SUKISU_VERSION=${SUKISU_VERSION}" >> "$GITHUB_ENV"
-        echo "SUSFS_VERSION=${SUSFS_VERSION}" >> "$GITHUB_ENV"
-        
-        echo "✅ Metadata saved:"
-        echo "   - Kernel: ${KERNEL_VERSION}"
-        echo "   - SukiSU: ${SUKISU_VERSION}"
-        echo "   - SUSFS: ${SUSFS_VERSION}"
+        # Cleanup (no output redirection)
+        ccache -M 3G
+        ccache --evict-older-than 7d || true
         
         echo "::endgroup::"
 
-    - name: Collect Build Stats / Validate Image
+    - name: Collect build statistics
       id: collect_stats
       shell: bash
       run: |
         set -euo pipefail
+        echo "::group::Collect build statistics"
         
         KERNEL_PATH="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
-        COMMON="$KERNEL_PATH/common"
-        OUT="$COMMON/out"
-        IMG="$OUT/arch/arm64/boot/Image"
-        
-        if [ -f "$COMMON/build.log" ]; then
-          WARNINGS_COUNT="$(LC_ALL=C grep -ciE '\bwarning:' "$COMMON/build.log" || true)"
-          [ -n "$WARNINGS_COUNT" ] || WARNINGS_COUNT="0"
-        else
-          WARNINGS_COUNT="0"
-        fi
+        IMG="$KERNEL_PATH/common/out/arch/arm64/boot/Image"
         
         if [ ! -f "$IMG" ]; then
           echo "::error::Kernel Image not found at: $IMG"
           exit 1
         fi
         
-        if ! file "$IMG" | grep -qi 'ARM64'; then
-          echo "::error::Image is not ARM64 format"
-          file "$IMG"
-          exit 1
+        IMAGE_SHA256=$(sha256sum "$IMG" | awk '{print $1}')
+        IMAGE_SIZE=$(stat -c%s "$IMG")
+        IMAGE_SIZE_MB=$(awk -v s="$IMAGE_SIZE" 'BEGIN{printf "%.2f", s/1024/1024}')
+        
+        # Count warnings/errors from build log
+        WARNINGS=0
+        ERRORS=0
+        if [ -f "$KERNEL_PATH/common/build.log" ]; then
+          WARNINGS=$(grep -c "warning:" "$KERNEL_PATH/common/build.log" 2>/dev/null || echo "0")
+          ERRORS=$(grep -c "error:" "$KERNEL_PATH/common/build.log" 2>/dev/null || echo "0")
         fi
         
-        IMG_SIZE=$(stat -c %s "$IMG")
-        MIN_SIZE=6102400
-        if [ "$IMG_SIZE" -lt "$MIN_SIZE" ]; then
-          echo "::error::Image size too small: $(numfmt --to=iec-i --suffix=B "$IMG_SIZE")"
-          exit 1
-        fi
+        # ✅ ONLY write to $GITHUB_OUTPUT here (grouped, single block)
+        {
+          echo "image_sha256=${IMAGE_SHA256}"
+          echo "image_size=${IMAGE_SIZE}"
+          echo "image_size_mb=${IMAGE_SIZE_MB}"
+          echo "build_time=${BUILD_TIME:-0}"
+          echo "warnings_count=${WARNINGS:-0}"
+          echo "errors_count=${ERRORS:-0}"
+        } >> "$GITHUB_OUTPUT"
         
-        IMG_SHA256=$(sha256sum "$IMG" | awk '{print $1}')
-        BUILD_TIME="${BUILD_TIME:-0}"
+        # ✅ Display summary to stdout ONLY (no redirection)
+        echo "📊 Build Statistics:"
+        echo "   Image SHA256: ${IMAGE_SHA256}"
+        echo "   Image Size: ${IMAGE_SIZE_MB} MB"
+        echo "   Build Time: $((BUILD_TIME / 60))m $((BUILD_TIME % 60))s"
+        echo "   Compiler Warnings: ${WARNINGS} warnings found"
+        echo "   Build Errors: ${ERRORS} errors found"
         
-        KERNEL_UNAME=$(strings "$IMG" | grep -E 'Linux version.*#' | tail -n1)
-        echo "Kernel Uname: $KERNEL_UNAME"
-        echo "KERNEL_UNAME=$KERNEL_UNAME" >> "$GITHUB_ENV"
-        
-        printf 'warnings_count=%s\n' "$WARNINGS_COUNT" >> "$GITHUB_OUTPUT"
-        printf 'image_sha256=%s\n' "$IMG_SHA256" >> "$GITHUB_OUTPUT"
-        printf 'build_time=%s\n' "$BUILD_TIME" >> "$GITHUB_OUTPUT"
+        echo "::endgroup::"
     
     - name: Download and Package ZRAM Module
+      id: zram_module
       if: ${{ inputs.enable_zram == 'true' }}
-      id: zram_find
-      shell: bash
       continue-on-error: true
-      run: |
-        set -e
-        echo "::group::Download and package ZRAM module"
-        echo "Fetching ZRAM module ZIP download link..."
-        retries=3
-        success=0
-        for i in $(seq 1 $retries); do
-          echo "Attempt $i of $retries..."
-          download_url=$(curl -s https://api.github.com/repos/Bouteillepleine/ZRAM-Module/releases/latest | \
-            grep "browser_download_url" | grep "ZRAM-Module-.*\.zip" | cut -d '"' -f 4 | head -n 1)
-    
-          if [ -n "$download_url" ]; then
-            echo "Successfully retrieved download link: $download_url"
-            wget -N "$download_url" && success=1 && break
-          else
-            echo "Failed to get download link, retrying in 3 seconds..."
-            sleep 3
-          fi
-        done
-    
-        if [ "$success" -ne 1 ]; then
-          echo "Failed to retrieve ZRAM module download link after $retries attempts"
-          echo "upload=false" >> "$GITHUB_OUTPUT"
-          echo "::endgroup::"
-          exit 0
-        fi
-    
-        unzip "$(ls -t ZRAM-Module-*.zip | head -1)" -d ZRAM-Module
-        target="./ZRAM-Module/zram/zram.ko"
-        
-        echo "Searching for zram.ko module file..."
-        search_paths=(
-          "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/common/out"
-          "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/out"
-          "$GITHUB_WORKSPACE/$CONFIG/device/qcom"
-        )
-        
-        zram_path=""
-        for path in "${search_paths[@]}"; do
-          zram_path=$(find "$path" -type f -name "zram.ko" 2>/dev/null | head -n 1)
-          [ -n "$zram_path" ] && break
-        done
-        
-        if [ -z "$zram_path" ]; then
-          zram_path=$(find "$GITHUB_WORKSPACE/$CONFIG" -type f -name "zram.ko" 2>/dev/null | head -n 1)
-        fi
-        
-        if [ -n "$zram_path" ] && [ -f "$zram_path" ]; then
-          echo "✅ ZRAM module found at: $zram_path"
-          mkdir -p "$(dirname "$target")"
-          if [ "$(realpath "$zram_path")" != "$(realpath "$target")" ]; then
-            cp "$zram_path" "$target"
-            echo "✅ ZRAM module copied to package"
-          else
-            echo "ℹ️ Source and target are the same, skipping copy"
-          fi
-          echo "upload=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "⚠️ zram.ko file not found in build output (may be built-in)"
-          echo "upload=false" >> "$GITHUB_OUTPUT"
-        fi
-        echo "::endgroup::"
-
-    - name: Download SUSFS Module from CI
       shell: bash
-      continue-on-error: true
-      env:
-        GITHUB_TOKEN: ${{ inputs.github_token }}
       run: |
         set -euo pipefail
-        echo "::group::Download SUSFS module"
-        
-        echo "Fetching latest successful workflow run for branch v1.5.2+..."
-        
-        LATEST_RUN_ID=$(curl -fsSL --retry 3 --connect-timeout 30 \
-          -H "Authorization: Bearer $GITHUB_TOKEN" \
-          -H "Accept: application/vnd.github+json" \
-          "https://api.github.com/repos/sidex15/susfs4ksu-module/actions/runs?status=success&per_page=50" | \
-          jq -r '.workflow_runs[] | select(.head_branch == "v1.5.2+") | .id' | head -n 1)
-        
-        if [ -z "$LATEST_RUN_ID" ]; then
-          echo "⚠️ No successful workflow run found for branch v1.5.2+"
-          echo "::warning::SUSFS module will not be included in the kernel ZIP"
-          echo "::endgroup::"
-          exit 0
-        fi
-        
-        echo "Found workflow run ID: $LATEST_RUN_ID"
-        echo "Fetching artifact download URL..."
-        
-        ARTIFACT_URL=$(curl -fsSL --retry 3 --connect-timeout 30 \
-          -H "Authorization: Bearer $GITHUB_TOKEN" \
-          -H "Accept: application/vnd.github+json" \
-          "https://api.github.com/repos/sidex15/susfs4ksu-module/actions/runs/$LATEST_RUN_ID/artifacts" | \
-          jq -r '.artifacts[0].archive_download_url // empty')
-        
-        if [ -z "$ARTIFACT_URL" ]; then
-          echo "⚠️ No artifact found in workflow run $LATEST_RUN_ID"
-          echo "::warning::SUSFS module will not be included in the kernel ZIP"
-          echo "::endgroup::"
-          exit 0
-        fi
-        
-        echo "Artifact URL: $ARTIFACT_URL"
-        echo "Downloading SUSFS module to AnyKernel3 directory..."
-        
-        if curl -fsSL --retry 3 --connect-timeout 30 \
-             -H "Authorization: Bearer $GITHUB_TOKEN" \
-             -H "Accept: application/vnd.github+json" \
-             -o "$GITHUB_WORKSPACE/AnyKernel3/ksu_module_susfs_1.5.2+_CI.zip" \
-             "$ARTIFACT_URL"; then
-          
-          if [ -f "$GITHUB_WORKSPACE/AnyKernel3/ksu_module_susfs_1.5.2+_CI.zip" ]; then
-            FILE_SIZE=$(stat -c%s "$GITHUB_WORKSPACE/AnyKernel3/ksu_module_susfs_1.5.2+_CI.zip")
+        echo "::group::Download ZRAM module"
             
-            if [ "$FILE_SIZE" -gt 1024 ]; then
-              echo "✅ SUSFS module downloaded successfully"
-              echo "   File: ksu_module_susfs_1.5.2+_CI.zip"
-              echo "   Size: $(numfmt --to=iec-i --suffix=B "$FILE_SIZE")"
-              ls -lh "$GITHUB_WORKSPACE/AnyKernel3/ksu_module_susfs_1.5.2+_CI.zip"
-            else
-              echo "⚠️ Downloaded file is too small (${FILE_SIZE} bytes)"
-              rm -f "$GITHUB_WORKSPACE/AnyKernel3/ksu_module_susfs_1.5.2+_CI.zip"
-              echo "::warning::SUSFS module download failed - file too small"
+        mkdir -p "${ARTIFACTS_DIR}"
+            
+        KERNEL_VER="${{ env.KERNEL_VER }}"
+        ANDROID_VER="${{ env.ANDROID_VER }}"
+            
+        ZRAM_BASE_URL="https://github.com/Numbersf/Action-Build/releases/download/zram-modules"
+            
+        case "$KERNEL_VER" in
+          5.10)
+            download_url="$ZRAM_BASE_URL/zram-${ANDROID_VER}-5.10.tar.gz"
+            ;;
+          5.15)
+            download_url="$ZRAM_BASE_URL/zram-${ANDROID_VER}-5.15.tar.gz"
+            ;;
+          6.1)
+            download_url="$ZRAM_BASE_URL/zram-${ANDROID_VER}-6.1.tar.gz"
+            ;;
+          6.6)
+            download_url="$ZRAM_BASE_URL/zram-${ANDROID_VER}-6.6.tar.gz"
+            ;;
+          *)
+            echo "::warning::ZRAM module not available for kernel $KERNEL_VER"
+            echo "zram_available=false" >> "$GITHUB_OUTPUT"
+            echo "::endgroup::"
+            exit 0
+            ;;
+        esac
+            
+        echo "Downloading ZRAM module from: $download_url"
+          
+        success=0
+        if [ -n "$download_url" ]; then
+          if wget -N "$download_url" -O "${ARTIFACTS_DIR}/zram-module.tar.gz" 2>&1 | tee /tmp/wget.log; then
+            if [ -f "${ARTIFACTS_DIR}/zram-module.tar.gz" ]; then
+              cd "${ARTIFACTS_DIR}"
+              if tar -xzf zram-module.tar.gz; then
+                rm -f zram-module.tar.gz
+                success=1
+                echo "✅ ZRAM module downloaded and extracted"
+              else
+                echo "::warning::Failed to extract ZRAM module"
+              fi
             fi
-          else
-            echo "⚠️ Downloaded file not found"
-            echo "::warning::SUSFS module download failed - file missing"
+           else
+            echo "::warning::wget failed for $download_url"
+            cat /tmp/wget.log || true
           fi
-        else
-          echo "⚠️ Failed to download SUSFS module"
-          echo "::warning::SUSFS module will not be included in the kernel ZIP"
         fi
-        
+            
+        if [ "$success" = "1" ]; then
+          echo "zram_available=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "zram_available=false" >> "$GITHUB_OUTPUT"
+        fi
+            
         echo "::endgroup::"
 
     - name: Create Flashable ZIP
@@ -1875,240 +1494,219 @@ runs:
         echo "::group::Create flashable ZIP"
         
         KERNEL_PATH="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
-        COMMON="$KERNEL_PATH/common"
-        OUT="$COMMON/out"
-        IMG="$OUT/arch/arm64/boot/Image"
-        
+        IMG="$KERNEL_PATH/common/out/arch/arm64/boot/Image"
         ANYKERNEL_DIR="$GITHUB_WORKSPACE/AnyKernel3"
+        
+        if [ ! -f "$IMG" ]; then
+          echo "::error::Kernel Image not found"
+          exit 1
+        fi
+        
+        if [ ! -d "$ANYKERNEL_DIR" ]; then
+          echo "::error::AnyKernel3 directory not found"
+          exit 1
+        fi
+        
         cd "$ANYKERNEL_DIR"
+        cp "$IMG" ./
         
-        # ✅ Copy ONLY the kernel Image
-        echo "📦 Copying kernel Image..."
-        cp "$IMG" "$ANYKERNEL_DIR/"
+        # Include ZRAM modules if available
+        if [ "${{ inputs.enable_zram }}" = "true" ] && [ "${{ steps.zram_module.outputs.zram_available }}" = "true" ]; then
+          echo "Including ZRAM modules..."
+          if [ -d "${ARTIFACTS_DIR}/modules" ]; then
+            mkdir -p ./modules
+            cp -r "${ARTIFACTS_DIR}/modules/"* ./modules/ || true
+            echo "✅ ZRAM modules included"
+          else
+            echo "⚠️ ZRAM modules directory not found"
+          fi
+        fi
         
-        KERNEL_VERSION="${TKERNEL_VER}"
-        SUKISU_VERSION="${SUKISUVER}"
-        SUSFS_VERSION="${SUSVER}"
-        DEVICE="${OP_MODEL}"
+        # Build ZIP filename
+        KERNEL_VERSION="${{ env.KERNEL_FULL_VER }}"
+        DEVICE_MODEL="${{ env.OP_MODEL }}"
+        BUILD_DATE=$(date -u '+%Y%m%d')
+        ZIP_NAME="SukiSU-Ultra-${DEVICE_MODEL}-${KERNEL_VERSION}-${BUILD_DATE}.zip"
         
-        ZIP_NAME="${DEVICE}_${KERNEL_VERSION}_SukiSU_${SUKISU_VERSION}_SUSFS_${SUSFS_VERSION}.zip"
+        echo "Creating ZIP: $ZIP_NAME"
         
-        # Create ZIP (exclude git files, README, and other ZIPs)
-        echo "📦 Creating flashable ZIP..."
-        zip -r9 "$ZIP_NAME" . -x '*.git*' -x 'README.md' -x '*.zip'
+        if ! command -v zip >/dev/null 2>&1; then
+          echo "::error::zip command not found"
+          exit 1
+        fi
         
+        zip -r9 "$ZIP_NAME" . -x .git\* -x .github\* -x README.md -x LICENSE
+        
+        if [ ! -f "$ZIP_NAME" ]; then
+          echo "::error::ZIP creation failed"
+          exit 1
+        fi
+        
+        # Calculate ZIP metrics
         ZIP_SIZE=$(stat -c%s "$ZIP_NAME")
+        ZIP_SIZE_MB=$(awk -v s="$ZIP_SIZE" 'BEGIN{printf "%.2f", s/1024/1024}')
         ZIP_SHA256=$(sha256sum "$ZIP_NAME" | awk '{print $1}')
         
-        ARTIFACTS_DIR="$GITHUB_WORKSPACE/$CONFIG/artifacts"
-        mkdir -p "$ARTIFACTS_DIR"
-        mv "$ZIP_NAME" "$ARTIFACTS_DIR/"
+        mv "$ZIP_NAME" "${ARTIFACTS_DIR}/"
         
-        echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
-        echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
-        echo "ZIP_SIZE=$ZIP_SIZE" >> "$GITHUB_ENV"
-        echo "ZIP_SHA256=$ZIP_SHA256" >> "$GITHUB_ENV"
+        # ✅ ONLY write to $GITHUB_OUTPUT here (grouped, single block)
+        {
+          echo "zip_name=${ZIP_NAME}"
+          echo "zip_path=${ARTIFACTS_DIR}/${ZIP_NAME}"
+          echo "zip_size=${ZIP_SIZE}"
+          echo "zip_size_mb=${ZIP_SIZE_MB}"
+          echo "zip_sha256=${ZIP_SHA256}"
+        } >> "$GITHUB_OUTPUT"
         
-        echo ""
+        # ✅ Display to stdout ONLY (no redirection)
         echo "✅ Flashable ZIP created"
-        echo "   Name: $ZIP_NAME"
-        echo "   Size: $(numfmt --to=iec-i --suffix=B "$ZIP_SIZE")"
-        echo "   SHA256: $ZIP_SHA256"
-        echo ""
-        echo "📋 ZIP Contents:"
-        echo "   - Image (kernel binary)"
-        echo "   - AnyKernel3 installer scripts"
-        echo "   - Installation tools (busybox, magiskboot)"
+        echo "   Name: ${ZIP_NAME}"
+        echo "   Size: ${ZIP_SIZE_MB} MB"
+        echo "   SHA256: ${ZIP_SHA256}"
+        
         echo "::endgroup::"
 
-    - name: 📤 Upload kernel artifact
-      if: success()
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ matrix.model }}-${{ env.ANDROID_VER }}-${{ env.KERNEL_VER }}-kernel
-        path: ${{ matrix.model }}/artifacts/${{ steps.build.outputs.zip_name }}
-        retention-days: 30
-        if-no-files-found: error
-        compression-level: 0  # ZIP is already compressed
+    - name: Save Metadata
+      id: save_metadata
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Save build metadata"
+        
+        # Create metadata JSON
+        cat > "${ARTIFACTS_DIR}/build_info.json" << EOF
+        {
+          "device": "${OP_MODEL}",
+          "soc": "${OP_SOC}",
+          "kernel_version": "${KERNEL_FULL_VER}",
+          "android_version": "${ANDROID_VER}",
+          "sukisu_version": "${SUKISUVER}",
+          "susfs_version": "${SUSVER:-unknown}",
+          "clang_version": "${CLANG_VERSION_SHORT}",
+          "build_date": "$(date -u '+%Y-%m-%d %H:%M:%S UTC')",
+          "build_time_seconds": ${BUILD_TIME:-0},
+          "optimization": "${{ inputs.optimize_level }}",
+          "hook_type": "${{ inputs.hook }}",
+          "lsm_enabled": ${{ inputs.lsm }},
+          "zram_enabled": ${{ inputs.enable_zram }},
+          "scheduler": "${{ inputs.sched }}",
+          "zip_name": "${{ steps.create_zip.outputs.zip_name }}",
+          "zip_sha256": "${{ steps.create_zip.outputs.zip_sha256 }}",
+          "image_sha256": "${{ steps.collect_stats.outputs.image_sha256 }}"
+        }
+        EOF
+        
+        # ✅ ONLY write to $GITHUB_OUTPUT here (grouped, single block)
+        {
+          echo "kernel_version=${KERNEL_FULL_VER}"
+          echo "sukisu_version=${SUKISUVER:-0}"
+          echo "susfs_version=${SUSVER:-unknown}"
+        } >> "$GITHUB_OUTPUT"
+        
+        # ✅ Display to stdout ONLY (no redirection)
+        echo "✅ Metadata saved to build_info.json"
+        cat "${ARTIFACTS_DIR}/build_info.json"
+        
+        echo "::endgroup::"
 
-    - name: Upload ZRAM Module
-      if: ${{ inputs.enable_zram == 'true' && steps.zram_find.outputs.upload == 'true' }}
-      uses: actions/upload-artifact@v4
-      with:
-        name: ZRAM-Module_${{ env.KERNEL_VER }}_${{ env.OP_MODEL }}
-        path: ZRAM-Module/*
-        retention-days: 30
-        compression-level: 9
-
-    - name: Final Build Summary
+    - name: Generate Build Summary
       if: always()
       shell: bash
       run: |
         set -euo pipefail
-        echo "::group::Build Summary"
         
-        # Get ccache rates with fallback
-        HIT_RATE="${{ steps.ccache_stats.outputs.hit_rate }}"
-        DIRECT_RATE="${{ steps.ccache_stats.outputs.direct_rate }}"
-        HIT_RATE="${HIT_RATE:-0.0}"
-        DIRECT_RATE="${DIRECT_RATE:-0.0}"
+        echo "# 🎉 Kernel Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
         
-        echo "============================================"
-        echo "📦 Build Summary"
-        echo "============================================"
-        echo ""
-        echo "Device Configuration:"
-        echo "  Model: ${OP_MODEL}"
-        echo "  SoC: ${OP_SOC}"
-        echo "  Android: ${ANDROID_VER}"
-        echo ""
-        echo "Kernel Information:"
-        echo "  Version: ${KERNEL_FULL_VER}"
-        echo "  Full: ${TKERNEL_VER}"
-        if [ -n "${KERNEL_UNAME:-}" ]; then
-          echo "  Uname: ${KERNEL_UNAME}"
+        if [ "${{ job.status }}" = "success" ]; then
+          echo "## ✅ Build Successful" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "## ❌ Build Failed" >> $GITHUB_STEP_SUMMARY
         fi
-        echo ""
-        echo "SukiSU Ultra:"
-        echo "  Version: ${SUKISUVER}"
-        echo ""
-        echo "SUSFS:"
-        echo "  Version: ${SUSVER}"
-        echo ""
-        echo "Build Configuration:"
-        echo "  Optimization: ${{ inputs.optimize_level }}"
-        echo "  Clean Build: ${{ inputs.clean }}"
-        echo "  Compiler: ${CLANG_FULL_VERSION}"
-        echo "  Build User: ${BUILD_USER}"
-        echo "  Build Host: ${BUILD_HOST}"
-        echo ""
-        echo "Optional Features:"
-        echo "  Hook Type: ${{ inputs.hook }}"
-        echo "  BBG LSM: ${{ inputs.lsm }}"
-        echo "  ZRAM: ${{ inputs.enable_zram }}"
-        echo "  Fengchi: ${{ inputs.sched }}"
-        echo ""
-        if [ "${{ inputs.clean }}" != "true" ]; then
-          echo "ccache Statistics:"
-          echo "  Hit Rate: ${HIT_RATE}%"
-          echo "  Direct Rate: ${DIRECT_RATE}%"
-          echo ""
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        echo "## 📱 Device Information" >> $GITHUB_STEP_SUMMARY
+        echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Device | ${OP_MODEL} |" >> $GITHUB_STEP_SUMMARY
+        echo "| SoC | ${OP_SOC} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Kernel | ${KERNEL_FULL_VER:-unknown} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Android | ${ANDROID_VER:-unknown} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        echo "## 🔧 Build Configuration" >> $GITHUB_STEP_SUMMARY
+        echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| SukiSU Version | v${SUKISUVER:-unknown} |" >> $GITHUB_STEP_SUMMARY
+        echo "| SUSFS Version | ${SUSVER:-unknown} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Clang | ${CLANG_VERSION_SHORT:-unknown} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Optimization | ${{ inputs.optimize_level }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Hook Type | ${{ inputs.hook }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| LSM (BBG) | ${{ inputs.lsm }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| ZRAM | ${{ inputs.enable_zram }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Scheduler | ${{ inputs.sched }} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ job.status }}" = "success" ]; then
+          echo "## 📦 Build Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "| Artifact | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| ZIP Name | ${{ steps.create_zip.outputs.zip_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ZIP Size | ${{ steps.create_zip.outputs.zip_size_mb }} MB |" >> $GITHUB_STEP_SUMMARY
+          echo "| ZIP SHA256 | \`${{ steps.create_zip.outputs.zip_sha256 }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image SHA256 | \`${{ steps.collect_stats.outputs.image_sha256 }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ inputs.enable_zram }}" = "true" ]; then
+            if [ "${{ steps.zram_module.outputs.zram_available }}" = "true" ]; then
+              echo "| ZRAM Module | ✅ Included |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| ZRAM Module | ⚠️ Not available |" >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
         fi
-        echo "Build Results:"
+        
+        echo "## ⏱️ Build Performance" >> $GITHUB_STEP_SUMMARY
+        echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+        
         if [ -n "${BUILD_TIME:-}" ]; then
-          echo "  Duration: $((BUILD_TIME / 60))m $((BUILD_TIME % 60))s"
+          BUILD_MIN=$((BUILD_TIME / 60))
+          BUILD_SEC=$((BUILD_TIME % 60))
+          echo "| Build Time | ${BUILD_MIN}m ${BUILD_SEC}s |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "| Build Time | N/A |" >> $GITHUB_STEP_SUMMARY
         fi
-        if [ -n "${{ steps.collect_stats.outputs.warnings_count }}" ]; then
-          echo "  Warnings: ${{ steps.collect_stats.outputs.warnings_count }}"
-        fi
-        if [ -n "${{ steps.collect_stats.outputs.image_sha256 }}" ]; then
-          echo "  Image SHA256: ${{ steps.collect_stats.outputs.image_sha256 }}"
-        fi
-        echo ""
-        if [ -n "${ZIP_NAME:-}" ]; then
-          echo "Output Package:"
-          echo "  File: ${ZIP_NAME}"
-          if [ -n "${ZIP_SIZE:-}" ]; then
-            echo "  Size: $(numfmt --to=iec-i --suffix=B "$ZIP_SIZE")"
-          fi
-          if [ -n "${ZIP_SHA256:-}" ]; then
-            echo "  SHA256: ${ZIP_SHA256}"
-          fi
-        fi
-        echo "============================================"
-        echo "::endgroup::"
         
-        # GitHub Step Summary
-        {
-          echo "# 📦 Kernel Build Summary"
-          echo ""
-          echo "## 📱 Device Configuration"
-          echo ""
-          echo "| Property | Value |"
-          echo "|----------|-------|"
-          echo "| **Model** | ${OP_MODEL} |"
-          echo "| **SoC** | ${OP_SOC} |"
-          echo "| **Android** | ${ANDROID_VER} |"
-          echo ""
-          echo "## 🐧 Kernel Information"
-          echo ""
-          echo "| Property | Value |"
-          echo "|----------|-------|"
-          echo "| **Version** | ${KERNEL_FULL_VER} |"
-          echo "| **Full Version** | ${TKERNEL_VER} |"
-          if [ -n "${KERNEL_UNAME:-}" ]; then
-            echo "| **Uname** | \`${KERNEL_UNAME}\` |"
+        if [ "${{ inputs.clean }}" != "true" ]; then
+          if [ -n "${{ steps.ccache_stats.outputs.hit_rate }}" ]; then
+            echo "| ccache Hit Rate | ${{ steps.ccache_stats.outputs.hit_rate }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| ccache Direct Rate | ${{ steps.ccache_stats.outputs.direct_rate }} |" >> $GITHUB_STEP_SUMMARY
           fi
-          echo ""
-          echo "## 🔐 SukiSU Ultra"
-          echo ""
-          echo "| Property | Value |"
-          echo "|----------|-------|"
-          echo "| **Version** | ${SUKISUVER} |"
-          echo ""
-          echo "## 🛡️ SUSFS"
-          echo ""
-          echo "| Property | Value |"
-          echo "|----------|-------|"
-          echo "| **Version** | ${SUSVER} |"
-          echo ""
-          echo "## 🔧 Build Configuration"
-          echo ""
-          echo "| Property | Value |"
-          echo "|----------|-------|"
-          echo "| **Optimization** | ${{ inputs.optimize_level }} |"
-          echo "| **Clean Build** | ${{ inputs.clean }} |"
-          echo "| **Compiler** | ${CLANG_FULL_VERSION} |"
-          echo "| **Build User** | ${BUILD_USER} |"
-          echo "| **Build Host** | ${BUILD_HOST} |"
-          echo ""
-          echo "## ⚙️ Optional Features"
-          echo ""
-          echo "| Feature | Enabled |"
-          echo "|---------|---------|"
-          echo "| **Hook Type** | ${{ inputs.hook }} |"
-          echo "| **BBG LSM** | ${{ inputs.lsm }} |"
-          echo "| **ZRAM** | ${{ inputs.enable_zram }} |"
-          echo "| **Fengchi** | ${{ inputs.sched }} |"
-          echo ""
-          if [ "${{ inputs.clean }}" != "true" ]; then
-            echo "## 📊 ccache Statistics"
-            echo ""
-            echo "| Metric | Value |"
-            echo "|--------|-------|"
-            echo "| **Hit Rate** | ${HIT_RATE}% |"
-            echo "| **Direct Rate** | ${DIRECT_RATE}% |"
-            echo ""
-          fi
-          echo "## 📈 Build Results"
-          echo ""
-          echo "| Metric | Value |"
-          echo "|--------|-------|"
-          if [ -n "${BUILD_TIME:-}" ]; then
-            echo "| **Duration** | $((BUILD_TIME / 60))m $((BUILD_TIME % 60))s |"
-          fi
-          if [ -n "${{ steps.collect_stats.outputs.warnings_count }}" ]; then
-            echo "| **Warnings** | ${{ steps.collect_stats.outputs.warnings_count }} |"
-          fi
-          if [ -n "${{ steps.collect_stats.outputs.image_sha256 }}" ]; then
-            echo "| **Image SHA256** | \`${{ steps.collect_stats.outputs.image_sha256 }}\` |"
-          fi
-          echo ""
-          if [ -n "${ZIP_NAME:-}" ]; then
-            echo "## 📦 Output Package"
-            echo ""
-            echo "| Property | Value |"
-            echo "|----------|-------|"
-            echo "| **File** | \`${ZIP_NAME}\` |"
-            if [ -n "${ZIP_SIZE:-}" ]; then
-              echo "| **Size** | $(numfmt --to=iec-i --suffix=B "$ZIP_SIZE") |"
-            fi
-            if [ -n "${ZIP_SHA256:-}" ]; then
-              echo "| **SHA256** | \`${ZIP_SHA256}\` |"
-            fi
-          fi
-          echo ""
-          echo "---"
-          echo ""
-          echo "✅ **Build completed successfully!**"
-        } >> $GITHUB_STEP_SUMMARY
+        else
+          echo "| ccache | Disabled (clean build) |" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        if [ -n "${{ steps.collect_stats.outputs.warnings_count }}" ]; then
+          echo "| Warnings | ${{ steps.collect_stats.outputs.warnings_count }} |" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        if [ -n "${{ steps.collect_stats.outputs.errors_count }}" ]; then
+          echo "| Errors | ${{ steps.collect_stats.outputs.errors_count }} |" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        echo "## 🔍 System Resources" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        echo "Disk Usage:" >> $GITHUB_STEP_SUMMARY
+        df -h / | tail -n1 >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "Memory:" >> $GITHUB_STEP_SUMMARY
+        free -h | grep -E "^Mem:" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "---" >> $GITHUB_STEP_SUMMARY
+        echo "*Built with ❤️ by SukiSU Ultra Action*" >> $GITHUB_STEP_SUMMARY
