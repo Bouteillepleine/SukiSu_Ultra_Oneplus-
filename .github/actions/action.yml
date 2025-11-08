@@ -81,16 +81,15 @@ runs:
         set -euo pipefail
         echo "::group::Parse device configuration"
         echo '${{ inputs.op_config_json }}' > /tmp/config.json
-        
-        # ✅ FIXED: Quote values to survive spaces
-        jq -r 'to_entries[] | "OP_\(.key|ascii_upcase)=\"\(.value|tostring)\""' /tmp/config.json >> "$GITHUB_ENV"
+                
+        jq -r 'to_entries[] | "OP_\(.key|ascii_upcase)=\(.value|tostring)"' /tmp/config.json >> "$GITHUB_ENV"
         
         if jq -e '.os_version' /tmp/config.json >/dev/null 2>&1; then
           OP_OS_VERSION=$(jq -r '.os_version' /tmp/config.json)
         else
           OP_OS_VERSION="unknown"
         fi
-        echo "OP_OS_VERSION=\"$OP_OS_VERSION\"" >> "$GITHUB_ENV"
+        echo "OP_OS_VERSION=$OP_OS_VERSION" >> "$GITHUB_ENV"
         
         echo "Parsed config:"
         jq '.' /tmp/config.json
@@ -1873,12 +1872,13 @@ runs:
           echo "- **ccache:** $CCACHE_SIZE" >> $GITHUB_STEP_SUMMARY
         fi
         
-        if [ -d "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/prebuilts" ]; then
+        # ✅ FIXED: Check if CONFIG is set
+        if [ -n "${CONFIG:-}" ] && [ -d "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/prebuilts" ]; then
           PREBUILTS_SIZE=$(du -sh "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/prebuilts" 2>/dev/null | cut -f1)
           echo "- **Toolchain:** $PREBUILTS_SIZE" >> $GITHUB_STEP_SUMMARY
         fi
         
-        if [ -d "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/common/out" ]; then
+        if [ -n "${CONFIG:-}" ] && [ -d "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/common/out" ]; then
           OUT_SIZE=$(du -sh "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/common/out" 2>/dev/null | cut -f1)
           echo "- **Build output:** $OUT_SIZE" >> $GITHUB_STEP_SUMMARY
         fi
