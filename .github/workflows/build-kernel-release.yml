@@ -440,9 +440,8 @@ jobs:
             size_mb=$(echo "scale=2; $size / 1024 / 1024" | bc)
             sha256=$(sha256sum "$zip" | awk '{print $1}')
             
-            # Extract device name from ZIP filename
-            # Adjust this regex based on your actual ZIP naming pattern
-            device_name=$(echo "$name" | sed -E 's/^AK3_([^_]+)_.*/\1/')
+            # Extract device name from ZIP filename (SukiSU-Ultra-MODEL-VERSION.zip)
+            device_name=$(echo "$name" | sed -E 's/^SukiSU-Ultra-([^-]+)-.*/\1/')
             
             cat >> notes.md << DEVICE
           ### 📦 $device_name
@@ -461,7 +460,7 @@ jobs:
           - 🌐 **WireGuard** - Built-in VPN support for secure connections
           - 💾 **ZRAM** - Memory compression with LZ4K/LZ4KD (optional)
           - 🔧 **BBG LSM** - Baseband Guard security module (optional)
-          - 🚀 **Compiler Optimizations** - O2/O3 optimizations with LTO
+          - 🚀 **Compiler Optimizations** - O2/O3 optimizations with ThinLTO
           - 🎯 **Multiple Hook Types** - kprobe, manual, or tracepoint
           
           ## 🔧 Build Configuration
@@ -482,6 +481,7 @@ jobs:
           ## ⚠️ Important Notes
           - Always backup your data before flashing
           - Check device compatibility before flashing
+          - First boot may take longer than usual
           
           ## 🔗 Useful Links
           - [SUSFS Module](https://github.com/sidex15/ksu_module_susfs)
@@ -492,7 +492,7 @@ jobs:
           - **Built on:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
           - **Workflow:** ${{ github.workflow }}
           - **Run:** [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-          - **Commit:** [\`${{ github.sha }}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
+          - **Commit:** [\`$(echo ${{ github.sha }} | cut -c1-7)\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
           
           ## 💝 Support
           If you find this project useful, please consider:
