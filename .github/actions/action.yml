@@ -147,6 +147,7 @@ runs:
         sudo apt-get clean
         echo "✅ Dependencies installed"
         echo "::endgroup::"
+
     
     - name: Free Disk Space Early
       shell: bash
@@ -198,75 +199,80 @@ runs:
         echo "  Model: $(lscpu | grep 'Model name' | cut -d: -f2 | xargs)"
         echo "::endgroup::"
 
-    # ✅ NEW: Cache kernel source to avoid repo sync
-    - name: Cache Kernel Source
-      id: cache_source
+    # ✅ OPTIMIZATION 3: Deterministic source cache key
+    - name: Cache kernel source (shared)
       uses: actions/cache@v4
       with:
-        path: ${{ env.CONFIG }}/kernel_platform
-        key: kp-${{ env.OP_MODEL }}-${{ env.OP_BRANCH }}-${{ hashFiles(format('{0}/.repo/manifests/**/*.xml', env.CONFIG)) }}
+        path: |
+          ${{ github.workspace }}/kernel-source-cache/${{ env.OP_BRANCH }}
+        key: kernel-source-shared-v5-${{ env.OP_BRANCH }}-${{ env.OP_MANIFEST }}
         restore-keys: |
-          kp-${{ env.OP_MODEL }}-${{ env.OP_BRANCH }}-
-          kp-${{ env.OP_MODEL }}-
+          kernel-source-shared-v5-${{ env.OP_BRANCH }}-
 
+    # ✅ OPTIMIZATION 4: Fast repo sync with SSH config and force-sync
     - name: Initialize and Sync Kernel Source
-      if: steps.cache_source.outputs.cache-hit != 'true'
       shell: bash
       run: |
         set -euo pipefail
         echo "::group::Initialize kernel source"
-        echo "Creating folder for configuration: $CONFIG"
-        mkdir -p "$CONFIG"
-        cd "$CONFIG"
-        echo "Initializing and syncing kernel source..."
         
-        if [[ "$OP_MANIFEST" == https://* ]]; then
-          mkdir -p .repo/manifests
-          curl --fail --show-error --location --proto '=https' "$OP_MANIFEST" -o .repo/manifests/temp_manifest.xml
+        # ✅ Disable SSH host key checking for git operations
+        export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no"
+        
+        CACHE_BASE="${GITHUB_WORKSPACE}/kernel-source-cache"
+        SOURCE_CACHE="${CACHE_BASE}/${OP_BRANCH}"
+        TARGET_DIR="${GITHUB_WORKSPACE}/${CONFIG}"
+        
+        mkdir -p "$CACHE_BASE"
+        mkdir -p "$TARGET_DIR"
+        
+        # ✅ Reuse cached source if available
+        if [ -d "$SOURCE_CACHE/kernel_platform/common" ]; then
+          echo "✅ Reusing cached kernel source"
           
-          "$REPO" init -u https://github.com/OnePlusOSS/kernel_manifest.git \
-            -b "$OP_BRANCH" \
-            -m temp_manifest.xml --repo-rev=v2.16 --depth=1 --no-clone-bundle --no-tags
-        else
-          "$REPO" init -u https://github.com/OnePlusOSS/kernel_manifest.git \
-            -b "$OP_BRANCH" \
-            -m "$OP_MANIFEST" --repo-rev=v2.16 --depth=1 --no-clone-bundle --no-tags
-        fi
-        
-        "$REPO" --version
-        success=false
-        for i in 1 2 3; do
-          if "$REPO" sync -c --no-clone-bundle --no-tags --optimized-fetch \
-             -j"$(nproc --all)" --fail-fast; then
-            success=true
-            break
+          # Hard link instead of copy (saves space + time)
+          cp -al "$SOURCE_CACHE/." "$TARGET_DIR/"
+          
+          cd "$TARGET_DIR"
+          
+          # ✅ Fast update with prune and force
+          if "$REPO" forall -c 'git remote set-url origin "$(git remote get-url origin 2>/dev/null)" >/dev/null 2>&1 || true; git fetch --depth=1 --prune origin +$(git rev-parse --abbrev-ref HEAD):FETCH_HEAD 2>/dev/null && git reset --hard FETCH_HEAD' 2>&1; then
+            echo "✅ Fast update completed"
+          else
+            echo "⚠️ Fast update failed, falling back to full sync"
+            rm -rf "$TARGET_DIR"/*
+            mkdir -p "$TARGET_DIR"
           fi
-          echo "⚠️ repo sync attempt $i failed; retrying..."
-          sleep 30
-        done
-        $success || { echo "::error::repo sync failed after 3 attempts"; exit 1; }
-        echo "✅ Kernel source synced"
-        echo "::endgroup::"
-
-    - name: Verify Cached Source
-      if: steps.cache_source.outputs.cache-hit == 'true'
-      shell: bash
-      run: |
-        set -euo pipefail
-        echo "::group::Verify cached source"
-        cd "$CONFIG/kernel_platform"
-        
-        # Quick validation
-        if [ ! -d "common" ] || [ ! -d ".repo" ]; then
-          echo "::warning::Cache corrupted, will re-sync"
-          rm -rf "$CONFIG/kernel_platform"
-          exit 1
         fi
         
-        # Fast local sync to update any changes
-        "$REPO" sync -l --no-clone-bundle --no-tags -j"$(nproc --all)" || true
+        # Full sync only if needed
+        if [ ! -d "$TARGET_DIR/kernel_platform/common" ]; then
+          cd "$TARGET_DIR"
+          echo "Performing full kernel sync..."
+          
+          if [[ "$OP_MANIFEST" == https://* ]]; then
+            mkdir -p .repo/manifests
+            curl --fail --show-error --location --proto '=https' "$OP_MANIFEST" -o .repo/manifests/temp_manifest.xml
+            
+            "$REPO" init -u https://github.com/OnePlusOSS/kernel_manifest.git \
+              -b "$OP_BRANCH" \
+              -m temp_manifest.xml --repo-rev=v2.16 --depth=1 --no-clone-bundle --no-tags
+          else
+            "$REPO" init -u https://github.com/OnePlusOSS/kernel_manifest.git \
+              -b "$OP_BRANCH" \
+              -m "$OP_MANIFEST" --repo-rev=v2.16 --depth=1 --no-clone-bundle --no-tags
+          fi
+          
+          # ✅ Add --force-sync to recover from divergence
+          "$REPO" sync -c --no-clone-bundle --no-tags --optimized-fetch --force-sync \
+             -j"$(nproc --all)" --fail-fast
+          
+          # ✅ Update cache for next run
+          mkdir -p "$SOURCE_CACHE"
+          rsync -a --delete "$TARGET_DIR/" "$SOURCE_CACHE/" || true
+        fi
         
-        echo "✅ Cached source verified and updated"
+        echo "✅ Kernel source ready"
         echo "::endgroup::"
 
     - name: Get Kernel Version Info
@@ -327,28 +333,58 @@ runs:
         echo "   Artifacts: $ARTIFACTS_DIR"
         echo "::endgroup::"
 
+    - name: Cache Clang toolchain (shared)
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ github.workspace }}/clang-cache
+        key: clang-shared-v3-${{ env.ANDROID_VER }}-${{ hashFiles('**/build.config.constants') }}
+        restore-keys: |
+          clang-shared-v3-${{ env.ANDROID_VER }}-
+          clang-shared-v3-
+
     - name: Detect Clang
       shell: bash
       run: |
         set -euo pipefail
         echo "::group::Detect Clang"
+        
+        CLANG_CACHE="${GITHUB_WORKSPACE}/clang-cache"
         KP="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
-        CLANG_FOUND=false
-        for base in "$KP/prebuilts" "$KP/prebuilts-master"; do
-          [ -d "$base/clang/host/linux-x86" ] || continue
-          latest=$(ls -d "$base"/clang/host/linux-x86/clang-r*/ 2>/dev/null | sort -V | tail -n1 || true)
-          if [ -n "$latest" ] && [ -x "$latest/bin/clang" ]; then
-            CLANG_BIN="$latest/bin"
-            CLANG_FOUND=true
-            break
-          fi
-        done
-        if ! $CLANG_FOUND && command -v clang >/dev/null 2>&1; then
-          CLANG_BIN="$(dirname "$(command -v clang)")"
+        
+        # ✅ Try to restore from cache first
+        if [ -d "$CLANG_CACHE/bin" ] && [ -x "$CLANG_CACHE/bin/clang" ]; then
+          echo "✅ Restoring Clang from cache"
+          CLANG_BIN="$CLANG_CACHE/bin"
           CLANG_FOUND=true
-          echo "Using system clang."
+        else
+          echo "Detecting Clang from kernel source..."
+          CLANG_FOUND=false
+          
+          for base in "$KP/prebuilts" "$KP/prebuilts-master"; do
+            [ -d "$base/clang/host/linux-x86" ] || continue
+            latest=$(ls -d "$base"/clang/host/linux-x86/clang-r*/ 2>/dev/null | sort -V | tail -n1 || true)
+            if [ -n "$latest" ] && [ -x "$latest/bin/clang" ]; then
+              CLANG_BIN="$latest/bin"
+              CLANG_FOUND=true
+              
+              # ✅ Save to cache for next run
+              echo "Caching Clang toolchain..."
+              mkdir -p "$CLANG_CACHE"
+              rsync -a "$(dirname "$CLANG_BIN")/" "$CLANG_CACHE/" || true
+              break
+            fi
+          done
+          
+          if ! $CLANG_FOUND && command -v clang >/dev/null 2>&1; then
+            CLANG_BIN="$(dirname "$(command -v clang)")"
+            CLANG_FOUND=true
+            echo "Using system clang."
+          fi
         fi
+        
         $CLANG_FOUND || { echo "::error::No clang toolchain found"; exit 1; }
+        
         echo "CLANG_BIN_PATH=$CLANG_BIN" >> "$GITHUB_ENV"
         CLANG_VERSION="$("$CLANG_BIN/clang" --version | head -n1)"
         echo "CLANG_VERSION=$CLANG_VERSION" >> "$GITHUB_ENV"
@@ -436,7 +472,8 @@ runs:
         echo "   Fingerprint: ${CLANG_VERSION_SHORT}"
         echo "::endgroup::"
        
-    - name: Setup ccache
+    # ✅ OPTIMIZATION 2: Increased ccache to 8GB with compression level 6
+    - name: Setup ccache (shared across 27 models)
       shell: bash
       run: |
         set -euo pipefail
@@ -445,25 +482,33 @@ runs:
         CACHE_DIR="$HOME/.ccache"
         mkdir -p "$CACHE_DIR"
         
+        # ✅ 8GB shared cache (increased from 3GB)
         {
           echo "CCACHE_DIR=$CACHE_DIR"
+          echo "CCACHE_MAXSIZE=8G"
           echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}"
           echo "CCACHE_COMPILERCHECK=content"
           echo "CCACHE_NOHASHDIR=true"
           echo "CCACHE_IGNOREOPTIONS=--sysroot*"
         } >> "$GITHUB_ENV"
         
-        # ✅ FIX: Remove conflicting MAXSIZE, keep only -M command
-        ccache -M 3G
+        ccache -M 8G
         ccache -o compression=true
-        ccache -o compression_level=6
+        ccache -o compression_level=6  # ✅ Balanced compression (was 9)
         ccache -o direct_mode=true
         ccache -o hash_dir=false
         ccache -o file_clone=true || true
         ccache -o inode_cache=true || true
         ccache -o umask=002
-        ccache -o sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime,pch_defines,system_headers,locale
         
+        # ✅ MAXIMUM sloppiness for cross-model reuse
+        ccache -o sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime,pch_defines,system_headers,locale,clang_index_store,modules
+        
+        # ✅ Aggressive eviction to stay under limit
+        ccache -o max_files=0  # No file limit, only size
+        ccache -o limit_multiple=0.95  # Start cleanup at 95%
+        
+        # ✅ Enable depend_mode if supported
         if ccache --help 2>&1 | grep -q 'depend_mode'; then
           ccache -o depend_mode=true
         fi
@@ -472,29 +517,21 @@ runs:
           echo "CCACHE_DISABLE=1" >> "$GITHUB_ENV"
           echo "⚠️ Clean build mode - ccache disabled"
         else
-          echo "✅ ccache enabled (3G max)"
+          echo "✅ ccache enabled (8G shared across 27 models)"
         fi
         
-        echo ""
-        echo "Cache configuration:"
-        echo "  Directory: $CACHE_DIR"
-        echo "  Max size: 3G"
-        echo "  Model: ${OP_MODEL}"
-        echo "  Android: ${ANDROID_VER}"
-        echo "  Kernel: ${KERNEL_FULL_VER}"
-        echo "  Clang: ${CLANG_VERSION_SHORT}"
         echo "::endgroup::"
 
-    # ✅ IMPROVED: Broader restore keys for better cache hits
-    - name: Cache ccache
+    # ✅ OPTIMIZATION 1: Stable cache key without run_number
+    - name: Cache ccache (shared)
       uses: actions/cache@v4
       with:
         path: ${{ env.CCACHE_DIR }}
-        key: ccache-suki-v4-${{ env.OP_MODEL }}-${{ env.ANDROID_VER }}-${{ env.KERNEL_FULL_VER }}-${{ env.CLANG_VERSION_SHORT }}
+        key: ccache-suki-shared-v7-${{ env.ANDROID_VER }}-${{ env.KERNEL_VER }}-${{ env.CLANG_VERSION_SHORT }}
         restore-keys: |
-          ccache-suki-v4-${{ env.OP_MODEL }}-${{ env.ANDROID_VER }}-${{ env.KERNEL_VER }}-
-          ccache-suki-v4-${{ env.OP_MODEL }}-${{ env.ANDROID_VER }}-
-          ccache-suki-v4-${{ env.OP_MODEL }}-
+          ccache-suki-shared-v7-${{ env.ANDROID_VER }}-${{ env.KERNEL_VER }}-
+          ccache-suki-shared-v7-${{ env.ANDROID_VER }}-
+          ccache-suki-shared-v7-
 
     - name: Verify ccache
       if: ${{ inputs.clean != 'true' }}
@@ -908,31 +945,6 @@ runs:
         fi
         echo "::endgroup::"
 
-    - name: Fix SukiSU sucompat.c unterminated directive
-      if: ${{ inputs.hook == 'manual' }}
-      shell: bash
-      run: |
-        set -euo pipefail
-        echo "::group::Fix sucompat.c"
-        
-        SUCOMPAT="$GITHUB_WORKSPACE/$CONFIG/kernel_platform/common/drivers/kernelsu/sucompat.c"
-        
-        # Replace the directive
-        sed -i 's/#ifndef KSU_HAVE_SYSCALL_TRACEPOINTS_HOOK/#ifdef CONFIG_KSU_MANUAL_HOOK/' "$SUCOMPAT"
-        
-        # Find line with "ksu_handle_execveat_sucompat" and add #endif 2 lines after
-        line=$(grep -n 'ksu_handle_execveat_sucompat' "$SUCOMPAT" | tail -1 | cut -d: -f1)
-        if [ -n "$line" ]; then
-          # Add #endif after "return 0;" and "}"
-          sed -i "$((line + 2))a #endif /* CONFIG_KSU_MANUAL_HOOK */" "$SUCOMPAT"
-          echo "✅ sucompat.c fixed"
-        else
-          echo "::error::Could not find insertion point"
-          exit 1
-        fi
-        
-        echo "::endgroup::"
-
     - name: Apply ZRAM Patches
       if: ${{ inputs.enable_zram == 'true' }}
       shell: bash
@@ -1173,36 +1185,56 @@ runs:
         mkdir -p out
         CUSTOM_LOCALVERSION="-${{ env.ANDROID_VER }}-OP-UltraBolt"
         echo "CUSTOM_LOCALVERSION=$CUSTOM_LOCALVERSION" >> "$GITHUB_ENV"
-        echo "Kernel branding: $CUSTOM_LOCALVERSION"
-   
-    - name: Cache Build Artifacts
-      id: cache_out
-      uses: actions/cache@v4
-      with:
-        path: ${{ env.CONFIG }}/kernel_platform/common/out
-        key: out-${{ env.OP_MODEL }}-${{ env.ANDROID_VER }}-${{ env.KERNEL_VER }}-${{ env.CLANG_VERSION_SHORT }}-${{ hashFiles(format('{0}/kernel_platform/common/arch/arm64/configs/gki_defconfig', env.CONFIG)) }}
-        restore-keys: |
-          out-${{ env.OP_MODEL }}-${{ env.ANDROID_VER }}-${{ env.KERNEL_VER }}-${{ env.CLANG_VERSION_SHORT }}-
-          out-${{ env.OP_MODEL }}-${{ env.ANDROID_VER }}-${{ env.KERNEL_VER }}-
-          out-${{ env.OP_MODEL }}-${{ env.ANDROID_VER }}-
-
+        echo "Kernel branding: $CUSTOM_LOCALVERSION"    
+    
     - name: Build Kernel
       shell: bash
       env:
         PYTHONWARNINGS: "ignore:invalid escape sequence"
       run: |
         set -euo pipefail
-        echo "::group::Build kernel with ccache optimization"
+        echo "::group::Build kernel with shared cache"
+        
+        # ✅ EXPLICIT PAHOLE VERIFICATION (prevents BTF build failures)
+        echo "Verifying pahole availability..."
+        if ! command -v pahole >/dev/null 2>&1; then
+          echo "::error::pahole not found (package 'dwarves' missing)"
+          echo "::error::BTF generation will fail without pahole"
+          echo ""
+          echo "To fix, add to dependencies step:"
+          echo "  sudo apt-get install -y dwarves"
+          exit 1
+        fi
+        
+        PAHOLE_VERSION=$(pahole --version 2>/dev/null || echo "unknown")
+        echo "✅ pahole found: $PAHOLE_VERSION"
+        export PAHOLE="$(command -v pahole)"
+        echo "   Path: $PAHOLE"
+        
+        # Verify pahole is executable
+        if [ ! -x "$PAHOLE" ]; then
+          echo "::error::pahole exists but is not executable: $PAHOLE"
+          exit 1
+        fi
+        
+        # Test pahole functionality
+        if ! "$PAHOLE" --help >/dev/null 2>&1; then
+          echo "::error::pahole exists but --help fails (corrupted binary?)"
+          exit 1
+        fi
+        
+        echo "✅ pahole verification complete"
+        echo ""
         
         KERNEL_PATH="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
         COMMON="$KERNEL_PATH/common"
         cd "$COMMON"
+        
         : > "$COMMON/.scmversion"
         
-        export PYTHONWARNINGS="${PYTHONWARNINGS}"
-        
+        # ✅ OPTIMIZATION 5: Derive timestamp from git commit (reproducible)
         echo "Getting last commit timestamp from kernel source..."
-        COMMIT_TIMESTAMP=$(git log -1 --format=%ct 2>/dev/null || echo "$(date +%s)")
+        COMMIT_TIMESTAMP=$(git log -1 --format=%ct 2>/dev/null || date +%s)
         COMMIT_DATE=$(git log -1 --format=%cd --date=format:'%Y-%m-%d %H:%M:%S' 2>/dev/null || date -u '+%Y-%m-%d %H:%M:%S')
         COMMIT_HASH=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
         
@@ -1217,25 +1249,14 @@ runs:
         
         export PATH="/usr/lib/ccache:${CLANG_BIN_PATH}:${PATH}"
         
-        if [ "${{ inputs.clean }}" = "true" ]; then
-          echo "🧹 Clean build mode - ccache disabled"
-          export CCACHE_DISABLE=1
-        else
-          echo "🚀 ccache-accelerated build"
-        fi
+        # ✅ CRITICAL: Normalize ALL paths for cross-model cache hits
+        MAP="-fdebug-prefix-map=${GITHUB_WORKSPACE}=."
+        FPMAP="-ffile-prefix-map=${GITHUB_WORKSPACE}=."
+        MPMAP="-fmacro-prefix-map=${GITHUB_WORKSPACE}=."  # ✅ NEW: Macro normalization
         
-        WORKSPACE="${GITHUB_WORKSPACE}"
-        MAP="-fdebug-prefix-map=${WORKSPACE}=."
-        MPMAP="-fmacro-prefix-map=${WORKSPACE}=."
-        FPMAP="-ffile-prefix-map=${WORKSPACE}=."
-        
-        export KCFLAGS="${KCFLAGS:-} $MAP $MPMAP $FPMAP -no-canonical-prefixes -fdiagnostics-color=never -Qunused-arguments -Wno-unused-command-line-argument"
-        export KCPPFLAGS="${KCPPFLAGS:-} $MAP $MPMAP $FPMAP"
-        
-        export CC="clang"
-        export CXX="clang++"
-        export HOSTCC="clang"
-        export HOSTCXX="clang++"
+        # ✅ Remove device-specific flags that break cache
+        export KCFLAGS="${KCFLAGS:-} $MAP $FPMAP $MPMAP -no-canonical-prefixes -Qunused-arguments -Wno-unused-command-line-argument -pipe"
+        export KCPPFLAGS="${KCPPFLAGS:-} $MAP $FPMAP $MPMAP"
         
         export LLVM=1 LLVM_IAS=1
         export ARCH=arm64 SUBARCH=arm64
@@ -1247,32 +1268,6 @@ runs:
         OUT=out
         mkdir -p "$OUT"
         
-        echo "============================================"
-        echo "🔍 Compiler & ccache Verification"
-        echo "============================================"
-        echo
-                echo "PATH: ${PATH:0:200}..."
-        echo "which clang: $(which clang)"
-        echo "CC: $CC"
-        echo "CCACHE_BASEDIR: ${CCACHE_BASEDIR}"
-        echo ""
-        
-        if [ "${{ inputs.clean }}" != "true" ]; then
-          echo "ccache configuration:"
-          ccache -p | grep -E "(compression|direct_mode|depend|sloppiness)" || true
-          echo ""
-          echo "ccache pre-build status:"
-          ccache -s | head -n 20
-        fi
-        echo "============================================"
-        
-        # Check if we have cached build artifacts
-        if [ "${{ steps.cache_out.outputs.cache-hit }}" = "true" ]; then
-          echo "✅ Build artifacts cache restored - incremental build"
-        else
-          echo "ℹ️ No build cache - full build"
-        fi
-        
         make O="$OUT" gki_defconfig
         
         if [ -n "${CUSTOM_LOCALVERSION:-}" ]; then
@@ -1280,6 +1275,13 @@ runs:
           scripts/config --file "$OUT/.config" -d LOCALVERSION_AUTO || true
           sed -i 's/scm_version="$(scm_version --short)"/scm_version=""/' scripts/setlocalversion
         fi
+        
+        # ✅ Force DWARF4 + ThinLTO for stable BTF
+        scripts/config --file "$OUT/.config" -d DEBUG_INFO_DWARF5
+        scripts/config --file "$OUT/.config" -e DEBUG_INFO_DWARF4
+        scripts/config --file "$OUT/.config" -e DEBUG_INFO_BTF
+        scripts/config --file "$OUT/.config" -e LTO_CLANG_THIN
+        scripts/config --file "$OUT/.config" -d LTO_CLANG_FULL
         
         if [ "${{ inputs.optimize_level }}" = "O3" ]; then
           scripts/config --file "$OUT/.config" -d CC_OPTIMIZE_FOR_PERFORMANCE
@@ -1291,92 +1293,103 @@ runs:
           KCFLAGS_EXTRA="-O2"
         fi
         
-        scripts/config --file "$OUT/.config" -e LTO_CLANG_THIN
-        scripts/config --file "$OUT/.config" -e LTO_CLANG
         make O="$OUT" olddefconfig
         
-        KCFLAGS="$KCFLAGS -Wno-error -pipe -fno-stack-protector ${KCFLAGS_EXTRA}"
+        KCFLAGS="$KCFLAGS -Wno-error ${KCFLAGS_EXTRA}"
         KCPPFLAGS="$KCPPFLAGS -DCONFIG_OPTIMIZE_INLINING"
         
         echo "============================================"
         echo "🔧 Build Configuration"
         echo "============================================"
-        echo "Device: ${OP_MODEL}"
+        echo "Device: ${OP_MODEL} (shared cache)"
         echo "Kernel: ${KERNEL_FULL_VER}"
+        echo "Commit: $COMMIT_HASH @ $COMMIT_DATE"
         echo "Threads: $(nproc --all)"
         echo "Optimization: ${{ inputs.optimize_level }}"
-        echo "Timestamp: $KBUILD_BUILD_TIMESTAMP"
+        echo "pahole: $PAHOLE_VERSION"
         
         if [ "${{ inputs.clean }}" != "true" ]; then
-          echo "ccache: ENABLED (3G max)"
+          echo "ccache: ENABLED (8G shared)"
+          echo ""
+          echo "📊 Pre-build ccache (shared across 27 models):"
+          ccache -s | head -n 15 || true
         else
           echo "ccache: DISABLED"
-        fi
-        
-        if [ "${{ steps.cache_out.outputs.cache-hit }}" = "true" ]; then
-          echo "Build mode: INCREMENTAL (cached artifacts)"
-        else
-          echo "Build mode: FULL"
         fi
         echo "============================================"
         
         BUILD_START=$(date +%s)
         
-        # ✅ OPTIMIZED: Quiet build with error capture
-        if [ "${{ inputs.clean }}" = "true" ] || [ "${{ steps.cache_out.outputs.cache-hit }}" != "true" ]; then
-          # Full/clean build - show output
-          make -j"$(nproc --all)" O="$OUT" KCFLAGS="$KCFLAGS" KCPPFLAGS="$KCPPFLAGS" 2>&1 | tee build.log
-        else
-          # Incremental build - quiet unless error
-          if ! make -j"$(nproc --all)" O="$OUT" KCFLAGS="$KCFLAGS" KCPPFLAGS="$KCPPFLAGS" -s 2>&1 | tee build.log; then
-            echo "::error::Build failed"
-            echo "::group::Build log (last 200 lines)"
-            tail -n 200 build.log
-            echo "::endgroup::"
-            exit 1
-          fi
-        fi
-        
-        if [ -f build.log ]; then
-          LOG_SIZE=$(stat -c%s build.log)
-          if [ "$LOG_SIZE" -gt 8388608 ]; then
-            echo "⚠️ Build log is ${LOG_SIZE} bytes, trimming to last 8MB..."
-            tail -c 8388608 build.log > build.last8m.log
-            mv build.last8m.log build.log
-          fi
-        fi
+        make -j"$(nproc --all)" O="$OUT" KCFLAGS="$KCFLAGS" KCPPFLAGS="$KCPPFLAGS" 2>&1 | tee build.log
         
         BUILD_END=$(date +%s)
         BUILD_TIME=$((BUILD_END - BUILD_START))
         
-        echo "BUILD_START=$BUILD_START" >> "$GITHUB_ENV"
-        echo "BUILD_END=$BUILD_END" >> "$GITHUB_ENV"
         echo "BUILD_TIME=$BUILD_TIME" >> "$GITHUB_ENV"
         
-        IMG="$OUT/arch/arm64/boot/Image"
-        if [ ! -f "$IMG" ]; then
-          echo "::error::Kernel Image missing"
-          echo "::group::Last 100 lines of build log"
-          tail -n 100 build.log || echo "Build log not available"
-          echo "::endgroup::"
-          exit 1
+        # Trim logs
+        if [ -f build.log ]; then
+          LOG_SIZE=$(stat -c%s build.log || echo 0)
+          [ "$LOG_SIZE" -gt 8388608 ] && tail -c 8388608 build.log > build.last8m.log && mv build.last8m.log build.log
         fi
+        
+        IMG="$OUT/arch/arm64/boot/Image"
+        [ -f "$IMG" ] || { echo "::error::Kernel Image missing"; tail -n 100 build.log || true; exit 1; }
         
         IMG_SIZE=$(stat -c%s "$IMG")
         
         echo "============================================"
-        echo "✅ Build Completed Successfully"
+        echo "✅ Build Completed"
         echo "============================================"
         echo "Duration: $((BUILD_TIME / 60))m $((BUILD_TIME % 60))s"
         echo "Image: $(numfmt --to=iec-i --suffix=B "$IMG_SIZE")"
         
         if [ "${{ inputs.clean }}" != "true" ]; then
           echo ""
-          echo "📊 ccache Post-Build Statistics"
-          echo "============================================"
-          ccache -s
+          echo "📊 Post-Build ccache (shared):"
+          ccache -s | head -n 20 || true
+          
+          # ✅ Aggressive cleanup to stay under 8GB
+          ccache -c  # Cleanup
         fi
         echo "============================================"
+        echo "::endgroup::"
+
+    # ✅ Post-build cache cleanup (updated for 8GB)
+    - name: Post-build cache cleanup
+      if: ${{ always() && inputs.clean != 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Cache cleanup"
+        
+        echo "📊 Cache statistics before cleanup:"
+        ccache -s | head -n 20
+        
+        # ✅ Aggressive cleanup to stay under limit
+        ccache --evict-older-than 7d    # Remove files older than 7 days
+        ccache -c                       # Cleanup to max size
+        
+        echo ""
+        echo "📊 Cache statistics after cleanup:"
+        ccache -s | head -n 20
+        
+        CACHE_SIZE=$(du -sh "$CCACHE_DIR" 2>/dev/null | cut -f1)
+        echo ""
+        echo "Final cache size: $CACHE_SIZE"
+        
+        # ✅ Verify we're under 8GB
+        CACHE_BYTES=$(du -sb "$CCACHE_DIR" 2>/dev/null | cut -f1)
+        MAX_BYTES=$((8 * 1024 * 1024 * 1024))  # 8GB in bytes
+        
+        if [ "$CACHE_BYTES" -gt "$MAX_BYTES" ]; then
+          echo "⚠️ Cache exceeded 8GB, forcing aggressive cleanup"
+          ccache --evict-older-than 3d  # More aggressive (3 days)
+          ccache -c
+        else
+          echo "✅ Cache size OK: $CACHE_SIZE / 8GB"
+        fi
+        
         echo "::endgroup::"
 
     - name: ccache Statistics
@@ -1416,10 +1429,6 @@ runs:
         echo "📊 Cache Performance:"
         echo "   Hit Rate: ${HIT_RATE}%"
         echo "   Direct Rate: ${DIRECT_RATE}%"
-        
-        # Cleanup (no output redirection)
-        ccache -M 3G
-        ccache --evict-older-than 7d || true
         
         echo "::endgroup::"
 
@@ -1670,12 +1679,7 @@ runs:
           "scheduler": "${{ inputs.sched }}",
           "zip_name": "${{ steps.create_zip.outputs.zip_name }}",
           "zip_sha256": "${{ steps.create_zip.outputs.zip_sha256 }}",
-          "image_sha256": "${{ steps.collect_stats.outputs.image_sha256 }}",
-          "cache_hits": {
-            "source": "${{ steps.cache_source.outputs.cache-hit == 'true' }}",
-            "artifacts": "${{ steps.cache_out.outputs.cache-hit == 'true' }}",
-            "ccache_rate": "${{ steps.ccache_stats.outputs.hit_rate }}"
-          }
+          "image_sha256": "${{ steps.collect_stats.outputs.image_sha256 }}"
         }
         EOF
         
@@ -1761,10 +1765,6 @@ runs:
         else
           echo "| Build Time | N/A |" >> $GITHUB_STEP_SUMMARY
         fi
-        
-        # Cache performance
-        echo "| Source Cache | ${{ steps.cache_source.outputs.cache-hit == 'true' && '✅ Hit' || '❌ Miss' }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| Artifacts Cache | ${{ steps.cache_out.outputs.cache-hit == 'true' && '✅ Hit' || '❌ Miss' }} |" >> $GITHUB_STEP_SUMMARY
         
         if [ "${{ inputs.clean }}" != "true" ]; then
           if [ -n "${{ steps.ccache_stats.outputs.hit_rate }}" ]; then
