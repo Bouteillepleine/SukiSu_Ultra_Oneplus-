@@ -16,7 +16,7 @@ on:
         type: choice
         options:
           - ALL
-          - android16-6.12      # ✨ AJOUTÉ
+          - android16-6.12      
           - android15-6.6
           - android14-6.1
           - android14-5.15
@@ -25,6 +25,7 @@ on:
           - android12-5.10
           - OP13-CPH
           - OP13-PJZ
+          - OP13_OOS16-CPH
           - OP13r
           - OP13S
           - OP13T
