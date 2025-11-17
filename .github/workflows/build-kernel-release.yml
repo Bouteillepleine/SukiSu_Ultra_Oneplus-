@@ -51,11 +51,6 @@ on:
           - OP-PAD-2
           - OP-PAD-PRO
         default: ALL
-      hook:
-        description: 'Hook type'
-        type: choice
-        options: [kprobe, manual, tracepoint]
-        default: manual
       lsm:
         description: 'BBG LSM'
         type: boolean
@@ -110,16 +105,13 @@ jobs:
           input="${{ inputs.op_model }}"
           echo "📋 Filter: $input"
           
-          # 🔍 Improved filtering logic
           if [[ "$input" == "ALL" ]]; then
             filter="."
           elif [[ "$input" == android*-* ]]; then
-            # Extract android version and kernel version
             av="${input%-*}"
             kv="${input#*-}"
             filter="map(select(.android_version==\"$av\" and .kernel_version==\"$kv\"))"
           else
-            # 🆕 Flexible matching: try exact model first, then partial match
             filter="map(select(
               .model == \"$input\" or
               (.model | startswith(\"$input\")) or
@@ -158,7 +150,7 @@ jobs:
           **Target:** \`${{ inputs.op_model }}\`  
           **Devices:** ${{ steps.matrix.outputs.count }}  
           **Configuration:**
-          - Hook: \`${{ inputs.hook }}\`
+          - SUSFS: 2.0.0 (Auto-Hook)
           - Optimization: \`${{ inputs.optimize_level }}\`
           - ZRAM: ${{ inputs.enable_zram }}
           - BBG LSM: ${{ inputs.lsm }}
@@ -184,16 +176,11 @@ jobs:
           
           echo "::group::Swap configuration"
           
-          # Deactivate any existing swap
           sudo swapoff -a 2>/dev/null || true
-          
-          # Always clear immutable before touching (symmetry)
           sudo chattr -i -a /swapfile 2>/dev/null || true
           
           if [ ! -f /swapfile ]; then
-            # Prefer fallocate (fast); fallback to dd (portable)
             if sudo fallocate -l 3G /swapfile 2>/dev/null; then
-              # Verify non-sparse (critical for exotic filesystems)
               alloc_mb="$(sudo du -m /swapfile | awk '{print $1}')"
               if [ "${alloc_mb:-0}" -lt 3072 ]; then
                 sudo rm -f /swapfile
@@ -204,25 +191,19 @@ jobs:
               sudo dd if=/dev/zero of=/swapfile bs=1M count=3072 status=none
             fi
             
-            # Disable CoW after creation (best-effort; harmless if unsupported)
             sudo chattr +C /swapfile 2>/dev/null || true
-            
-            # Secure ownership and permissions
             sudo chown root:root /swapfile
             sudo chmod 600 /swapfile
             sudo mkswap /swapfile >/dev/null
           fi
           
-          # Enable swap; if header invalid, re-create and retry
           sudo swapon /swapfile 2>/dev/null || {
             sudo mkswap /swapfile >/dev/null
             sudo swapon /swapfile
           }
           
-          # Protect the swapfile from accidental modification
           sudo chattr +i /swapfile 2>/dev/null || true
           
-          # Ephemeral memory tuning for CI
           sudo install -m 0644 /dev/null /etc/sysctl.d/99-swap.conf
           sudo tee /etc/sysctl.d/99-swap.conf >/dev/null <<'SYSCTL_EOF'
           vm.swappiness=5
@@ -231,7 +212,6 @@ jobs:
           sudo chown root:root /etc/sysctl.d/99-swap.conf
           sudo sysctl -p /etc/sysctl.d/99-swap.conf >/dev/null
           
-          # Visibility: memory + active swap device
           echo ""
           echo "Memory status:"
           free -h
@@ -239,7 +219,6 @@ jobs:
           echo "Swap devices:"
           swapon --show
           
-          # Sanity: confirm our swapfile is active
           if ! swapon --show=NAME | grep -q '^/swapfile$'; then
             echo "::error::Swap file /swapfile not active"
             exit 1
@@ -255,7 +234,6 @@ jobs:
         with:
           op_config_json: ${{ toJSON(matrix) }}
           ksu_meta: 'susfs-main/⚡Ultra⚡/'
-          hook: ${{ inputs.hook }}
           lsm: ${{ inputs.lsm }}
           enable_zram: ${{ inputs.enable_zram }}
           sched: ${{ inputs.sched }}
@@ -401,20 +379,17 @@ jobs:
         run: |
           echo "::group::Prepare release"
           
-          # Verify artifacts directory exists
           if [ ! -d "artifacts" ]; then
             echo "::error::Artifacts directory not found"
             exit 1
           fi
           
-          # Show what was downloaded
           echo "Downloaded artifacts:"
           ls -lah artifacts/
           echo ""
           
           mkdir -p release
           
-          # Find all ZIP files recursively in artifacts directory
           find artifacts -type f -name "*.zip" -exec cp {} release/ \;
           
           count=$(ls -1 release/*.zip 2>/dev/null | wc -l)
@@ -435,8 +410,6 @@ jobs:
           echo "count=$count" >> $GITHUB_OUTPUT
           echo "total_size=$total_size" >> $GITHUB_OUTPUT
           
-          # Generate release notes
-          HOOK_TYPE="${{ inputs.hook }}"
           OPTIMIZE="${{ inputs.optimize_level }}"
           ZRAM="${{ inputs.enable_zram }}"
           LSM="${{ inputs.lsm }}"
@@ -444,22 +417,19 @@ jobs:
           CLEAN="${{ inputs.clean_build }}"
           
           cat > notes.md << 'EOF'
-          # 🚀 SukiSU Ultra with SUSFS v1.5.12
+          # 🚀 SukiSU Ultra with SUSFS 2.0.0
           
           ## 📱 Built Devices
           
           EOF
           
-          # Process each ZIP file
           for zip in release/*.zip; do
             name=$(basename "$zip" .zip)
             size=$(stat -c%s "$zip")
             size_mb=$(echo "scale=2; $size / 1024 / 1024" | bc)
             sha256=$(sha256sum "$zip" | awk '{print $1}')
             
-            # Extract device name from ZIP filename
-            # Adjust this regex based on your actual ZIP naming pattern
-            device_name=$(echo "$name" | sed -E 's/^AK3_([^_]+)_.*/\1/')
+            device_name=$(echo "$name" | sed -E 's/^SukiSU-Ultra-([^-]+)-.*/\1/')
             
             cat >> notes.md << DEVICE
           ### 📦 $device_name
@@ -474,16 +444,16 @@ jobs:
           
           ## ✨ Features
           - ⚡ **SukiSU Ultra Manager** - Advanced root management with enhanced UI
-          - 🛡️ **SUSFS v1.5.12** - Enhanced security and hiding capabilities
+          - 🛡️ **SUSFS 2.0.0** - Auto-hook system with enhanced security
           - 🌐 **WireGuard** - Built-in VPN support for secure connections
           - 💾 **ZRAM** - Memory compression with LZ4K/LZ4KD (optional)
           - 🔧 **BBG LSM** - Baseband Guard security module (optional)
           - 🚀 **Compiler Optimizations** - O2/O3 optimizations with LTO
-          - 🎯 **Multiple Hook Types** - kprobe, manual, or tracepoint
+          - 🎯 **Auto-Hook System** - Intelligent hook selection (SUSFS 2.0)
           - 📱 **Android 16 Support** - Full support for Android 16 (kernel 6.12)
           
           ## 🔧 Build Configuration
-          - **Hook Type:** ${HOOK_TYPE}
+          - **SUSFS Version:** 2.0.0 (Auto-Hook)
           - **Optimization:** ${OPTIMIZE}
           - **ZRAM:** ${ZRAM}
           - **BBG LSM:** ${LSM}
@@ -500,7 +470,14 @@ jobs:
           ## ⚠️ Important Notes
           - Always backup your data before flashing
           - Check device compatibility before flashing
+          - SUSFS 2.0.0 uses automatic hook selection - no manual configuration needed
           - Android 16 (6.12) kernels are experimental - test thoroughly
+          
+          ## 🆕 What's New in SUSFS 2.0.0
+          - **Auto-Hook System**: Intelligent hook type selection based on kernel version
+          - **Improved Stability**: Enhanced compatibility across different kernel versions
+          - **Better Performance**: Optimized hook implementation
+          - **Simplified Configuration**: No need to manually select hook type
           
           ## 🔗 Useful Links
           - [SUSFS Module](https://github.com/sidex15/ksu_module_susfs)
@@ -539,7 +516,7 @@ jobs:
           fi
           
           gh release create "$TAG" \
-            --title "🎯 OnePlus Kernels - SukiSU Ultra $TAG" \
+            --title "🎯 OnePlus Kernels - SukiSU Ultra $TAG (SUSFS 2.0.0)" \
             --notes-file notes.md \
             --prerelease \
             release/*.zip
@@ -561,6 +538,7 @@ jobs:
           ## 🎉 Release Created Successfully
           
           **Tag:** [\`${{ steps.tag.outputs.tag }}\`](${{ steps.release.outputs.release_url }})  
+          **SUSFS Version:** 2.0.0 (Auto-Hook)  
           **Kernels:** ${{ steps.prepare.outputs.count }}  
           **Total Size:** $(numfmt --to=iec-i --suffix=B ${{ steps.prepare.outputs.total_size }})
           
@@ -582,6 +560,12 @@ jobs:
           - [📦 Release Page](${{ steps.release.outputs.release_url }})
           - [📊 Workflow Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
           - [📝 Commit](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
+          
+          ### 🆕 SUSFS 2.0.0 Features
+          - ✅ Auto-Hook System (no manual configuration)
+          - ✅ Enhanced stability and compatibility
+          - ✅ Optimized performance
+          - ✅ Support for Android 16 (6.12)
           EOF
 
       - name: 🧹 Cleanup on failure
