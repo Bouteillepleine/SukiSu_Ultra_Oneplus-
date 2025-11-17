@@ -8,10 +8,6 @@ inputs:
     description: 'SukiSU Ultra metadata in format: branch/custom_tag/commit_hash'
     required: false
     default: 'susfs-main/⚡Ultra⚡/'
-  hook:
-    description: 'Hook type: kprobe (default), manual, or tracepoint'
-    required: false
-    default: 'manual'
   lsm:
     description: 'Enable Baseband Guard LSM security module'
     required: false
@@ -732,7 +728,6 @@ runs:
         TKERNEL_VERSION="${{ env.TKERNEL_VER }}"
         TRUSTY_EXISTS="false"
         
-        # ✨ AJOUT: Support android16-6.12
         if [[ "$KERNEL_VERSION" == "6.6" ]] || [[ "$KERNEL_VERSION" == "6.12" ]]; then
           if [ -f "$GITHUB_WORKSPACE/$CONFIG/.repo/manifests_fallback/$OP_MANIFEST" ]; then
             if grep -q 'common-modules/trusty' "$GITHUB_WORKSPACE/$CONFIG/.repo/manifests_fallback/$OP_MANIFEST" 2>/dev/null; then
@@ -740,7 +735,6 @@ runs:
             fi
           fi
           
-          # ✨ AJOUT: Condition pour 6.12
           if [[ "$KERNEL_VERSION" == "6.12" ]]; then
             if [[ "$TRUSTY_EXISTS" == "false" && "$(printf '%s\n' "$TKERNEL_VERSION" "6.12.0" | sort -V | head -n1)" = "$TKERNEL_VERSION" ]]; then
               echo "Fixing SUSFS for 6.12 without Trusty OS..."
@@ -758,7 +752,6 @@ runs:
         
         fake_patched=0
         
-        # ✨ AJOUT: Fake patch pour android16-6.12
         if [ "$GKI_V" = "android16-6.12" ]; then
           if ! grep -qxF $'\tunsigned int nr_subpages = __PAGE_SIZE / PAGE_SIZE;' ./fs/proc/task_mmu.c; then
             echo "Applying fake patch for android16-6.12"
@@ -794,7 +787,6 @@ runs:
         if [ "$fake_patched" = 1 ]; then
           echo "Reverting fake patches..."
           
-          # ✨ AJOUT: Revert pour android16-6.12
           if [ "$GKI_V" = "android16-6.12" ]; then
             if grep -qxF $'\tunsigned int nr_subpages = __PAGE_SIZE / PAGE_SIZE;' ./fs/proc/task_mmu.c; then
               echo "Reverting fake patch for android16-6.12"
@@ -843,47 +835,6 @@ runs:
         fi
         
         echo "✅ Hide stuff patches applied"
-        echo "::endgroup::"
-
-    - name: Apply HOOK Patches
-      if: ${{ inputs.hook != 'kprobe' }}
-      shell: bash
-      run: |
-        set -euo pipefail
-        echo "::group::Apply HOOK patches"
-        cd "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/common"
-        
-        HOOK_TYPE="${{ inputs.hook }}"
-        echo "Selected hook type: $HOOK_TYPE"
-        
-        case "$HOOK_TYPE" in
-          kprobe)
-            echo "Using kprobe hooks (default, no patch needed)"
-            ;;
-          manual)
-            echo "Applying manual hooks patch..."
-            cp "$GITHUB_WORKSPACE/SukiSU_patch/hooks/scope_min_manual_hooks_v1.6.patch" ./
-            if patch -p1 -F 3 < scope_min_manual_hooks_v1.6.patch; then
-              echo "✅ Manual hooks patch applied"
-            else
-              echo "::warning::Manual hooks patch applied with warnings"
-            fi
-            ;;
-          tracepoint)
-            echo "Applying tracepoint hooks patch..."
-            cp "$GITHUB_WORKSPACE/SukiSU_patch/hooks/sukisu_tracepoint_hooks_v1.1.patch" ./
-            if patch -p1 -F 3 < sukisu_tracepoint_hooks_v1.1.patch; then
-              echo "✅ Tracepoint hooks patch applied"
-            else
-              echo "::warning::Tracepoint hooks patch applied with warnings"
-            fi
-            ;;
-          *)
-            echo "::error::Unknown hook type: $HOOK_TYPE"
-            exit 1
-            ;;
-        esac
-        
         echo "::endgroup::"
 
     - name: Patch KernelSU sulog time64_to_tm clash
@@ -1021,19 +972,6 @@ runs:
         echo "CONFIG_KSU=y" >> "$CONFIG_FILE"
         echo "CONFIG_KPM=y" >> "$CONFIG_FILE"
         
-        HOOK="${{ inputs.hook }}"
-        if [ "$HOOK" = "kprobe" ]; then
-          echo "CONFIG_KSU_SUSFS_SUS_SU=y" >> "$CONFIG_FILE"
-          echo "CONFIG_KPROBES=y" >> "$CONFIG_FILE"
-          echo "CONFIG_KSU_KPROBES_HOOK=y" >> "$CONFIG_FILE"
-        elif [ "$HOOK" = "manual" ]; then
-          echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> "$CONFIG_FILE"
-          echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$CONFIG_FILE"
-        elif [ "$HOOK" = "tracepoint" ]; then
-          echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> "$CONFIG_FILE"
-          echo "CONFIG_KSU_TRACEPOINT_HOOK=y" >> "$CONFIG_FILE"
-        fi
-        
         cat >> "$CONFIG_FILE" << 'EOF'
         CONFIG_KSU_SUSFS=y
         CONFIG_KSU_SUSFS_SUS_PATH=y
@@ -1128,7 +1066,7 @@ runs:
         sed -i 's/check_defconfig//' ./common/build.config.gki
 
         echo "Configuration summary:"
-        echo "- Hook type: $HOOK"
+        echo "- SUSFS: 2.0.0 (auto-hook)"
         echo "- Optimization: $OPTIMIZE"
         echo "- ZRAM: ${{ inputs.enable_zram }}"
         echo "- LSM (BBG): $ENABLE_LSM"
@@ -1322,16 +1260,13 @@ runs:
         set -euo pipefail
         echo "::group::ccache statistics"
         
-        # ✅ Capture stats ONCE to avoid non-deterministic output
         STATS="$(ccache -s)"
         echo "$STATS"
         
-        # Parse metrics from captured output
         CACHEABLE=$(echo "$STATS" | awk '/Cacheable calls:/ {match($0, /[0-9]+/); print substr($0, RSTART, RLENGTH)}' | head -n1)
         HITS=$(echo "$STATS" | awk '/^[[:space:]]*Hits:/ {match($0, /[0-9]+/); print substr($0, RSTART, RLENGTH)}' | head -n1)
         DIRECT=$(echo "$STATS" | awk '/Direct:/ {match($0, /[0-9]+/); print substr($0, RSTART, RLENGTH)}' | head -n1)
         
-        # Calculate rates with defaults
         if [ "${CACHEABLE:-0}" -gt 0 ]; then
           HIT_RATE=$(awk -v h="${HITS:-0}" -v c="$CACHEABLE" 'BEGIN{printf "%.1f", (h/c)*100}')
           DIRECT_RATE=$(awk -v d="${DIRECT:-0}" -v c="$CACHEABLE" 'BEGIN{printf "%.1f", (d/c)*100}')
@@ -1340,19 +1275,16 @@ runs:
           DIRECT_RATE="0.0"
         fi
         
-        # ✅ ONLY write to $GITHUB_OUTPUT here (grouped, single block)
         {
           echo "hit_rate=${HIT_RATE}%"
           echo "direct_rate=${DIRECT_RATE}%"
         } >> "$GITHUB_OUTPUT"
         
-        # ✅ Display to stdout ONLY (no redirection)
         echo ""
         echo "📊 Cache Performance:"
         echo "   Hit Rate: ${HIT_RATE}%"
         echo "   Direct Rate: ${DIRECT_RATE}%"
         
-        # Cleanup (no output redirection)
         ccache -M 3G
         ccache --evict-older-than 7d || true
         
@@ -1379,7 +1311,6 @@ runs:
         IMAGE_SIZE=$(stat -c%s "$IMG")
         IMAGE_SIZE_MB=$(awk -v s="$IMAGE_SIZE" 'BEGIN{printf "%.2f", s/1024/1024}')
         
-        # Robust warning/error counts (no echo in command substitution)
         WARNINGS=0
         ERRORS=0
         if [ -f "$KERNEL_PATH/common/build.log" ]; then
@@ -1389,13 +1320,11 @@ runs:
           ERRORS=${ERRORS:-0}
         fi
         
-        # ✅ Validate critical outputs
         if [[ ! "$IMAGE_SHA256" =~ ^[a-f0-9]{64}$ ]]; then
           echo "::error::Invalid SHA256 format"
           exit 1
         fi
         
-        # ✅ Only key=value lines go to $GITHUB_OUTPUT
         {
           echo "image_sha256=$IMAGE_SHA256"
           echo "image_size=$IMAGE_SIZE"
@@ -1405,20 +1334,17 @@ runs:
           echo "errors_count=$ERRORS"
         } >> "$GITHUB_OUTPUT"
         
-        # ✅ Human-readable summary (stdout only)
         echo ""
         echo "📊 Build Statistics:"
         echo "   Image SHA256: $IMAGE_SHA256"
         echo "   Image Size: ${IMAGE_SIZE_MB} MB"
         
-        # Safe arithmetic
         if [ "${BUILD_TIME:-0}" -gt 0 ]; then
           echo "   Build Time: $((BUILD_TIME / 60))m $((BUILD_TIME % 60))s"
         else
           echo "   Build Time: N/A"
         fi
         
-        # Conditional formatting
         if [ "${WARNINGS}" -eq 0 ]; then
           echo "   Compiler Warnings: ✅ None"
         else
@@ -1463,7 +1389,6 @@ runs:
             download_url="$ZRAM_BASE_URL/zram-${ANDROID_VER}-6.6.tar.gz"
             ;;
           6.12)
-            # ✨ AJOUT: Support ZRAM pour 6.12
             download_url="$ZRAM_BASE_URL/zram-${ANDROID_VER}-6.12.tar.gz"
             ;;
           *)
@@ -1527,7 +1452,6 @@ runs:
         cd "$ANYKERNEL_DIR"
         cp "$IMG" ./
         
-        # Include ZRAM modules if available
         if [ "${{ inputs.enable_zram }}" = "true" ] && [ "${{ steps.zram_module.outputs.zram_available }}" = "true" ]; then
           echo "Including ZRAM modules..."
           if [ -d "${ARTIFACTS_DIR}/modules" ]; then
@@ -1539,11 +1463,15 @@ runs:
           fi
         fi
         
-        # Build ZIP filename
         KERNEL_VERSION="${{ env.KERNEL_FULL_VER }}"
         DEVICE_MODEL="${{ env.OP_MODEL }}"
-        BUILD_DATE=$(date -u '+%Y%m%d')
-        ZIP_NAME="SukiSU-Ultra-${DEVICE_MODEL}-${KERNEL_VERSION}.zip"
+        
+        SUFFIX=""
+        [ "${{ inputs.enable_zram }}" = "true" ] && SUFFIX="${SUFFIX}_LZ4KD"
+        [ "${{ inputs.lsm }}" = "true" ] && SUFFIX="${SUFFIX}_LSM"
+        [ "${{ inputs.sched }}" = "true" ] && SUFFIX="${SUFFIX}_SCHED"
+        
+        ZIP_NAME="SukiSU-Ultra-${DEVICE_MODEL}-${KERNEL_VERSION}${SUFFIX}.zip"
         
         echo "Creating ZIP: $ZIP_NAME"
         
@@ -1559,14 +1487,12 @@ runs:
           exit 1
         fi
         
-        # Calculate ZIP metrics
         ZIP_SIZE=$(stat -c%s "$ZIP_NAME")
         ZIP_SIZE_MB=$(awk -v s="$ZIP_SIZE" 'BEGIN{printf "%.2f", s/1024/1024}')
         ZIP_SHA256=$(sha256sum "$ZIP_NAME" | awk '{print $1}')
         
         mv "$ZIP_NAME" "${ARTIFACTS_DIR}/"
         
-        # ✅ ONLY write to $GITHUB_OUTPUT here (grouped, single block)
         {
           echo "zip_name=${ZIP_NAME}"
           echo "zip_path=${ARTIFACTS_DIR}/${ZIP_NAME}"
@@ -1575,7 +1501,6 @@ runs:
           echo "zip_sha256=${ZIP_SHA256}"
         } >> "$GITHUB_OUTPUT"
         
-        # ✅ Display to stdout ONLY (no redirection)
         echo "✅ Flashable ZIP created"
         echo "   Name: ${ZIP_NAME}"
         echo "   Size: ${ZIP_SIZE_MB} MB"
@@ -1590,7 +1515,6 @@ runs:
         set -euo pipefail
         echo "::group::Save build metadata"
         
-        # Create metadata JSON
         cat > "${ARTIFACTS_DIR}/build_info.json" << EOF
         {
           "device": "${OP_MODEL}",
@@ -1598,12 +1522,12 @@ runs:
           "kernel_version": "${KERNEL_FULL_VER}",
           "android_version": "${ANDROID_VER}",
           "sukisu_version": "${SUKISUVER}",
-          "susfs_version": "${SUSVER:-unknown}",
+          "susfs_version": "${SUSVER:-2.0.0}",
           "clang_version": "${CLANG_VERSION_SHORT}",
           "build_date": "$(date -u '+%Y-%m-%d %H:%M:%S UTC')",
           "build_time_seconds": ${BUILD_TIME:-0},
           "optimization": "${{ inputs.optimize_level }}",
-          "hook_type": "${{ inputs.hook }}",
+          "hook_type": "auto",
           "lsm_enabled": ${{ inputs.lsm }},
           "zram_enabled": ${{ inputs.enable_zram }},
           "scheduler": "${{ inputs.sched }}",
@@ -1613,14 +1537,12 @@ runs:
         }
         EOF
         
-        # ✅ ONLY write to $GITHUB_OUTPUT here (grouped, single block)
         {
           echo "kernel_version=${KERNEL_FULL_VER}"
           echo "sukisu_version=${SUKISUVER:-0}"
-          echo "susfs_version=${SUSVER:-unknown}"
+          echo "susfs_version=${SUSVER:-2.0.0}"
         } >> "$GITHUB_OUTPUT"
         
-        # ✅ Display to stdout ONLY (no redirection)
         echo "✅ Metadata saved to build_info.json"
         cat "${ARTIFACTS_DIR}/build_info.json"
         
@@ -1655,10 +1577,10 @@ runs:
         echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
         echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
         echo "| SukiSU Version | v${SUKISUVER:-unknown} |" >> $GITHUB_STEP_SUMMARY
-        echo "| SUSFS Version | ${SUSVER:-unknown} |" >> $GITHUB_STEP_SUMMARY
+        echo "| SUSFS Version | ${SUSVER:-2.0.0} |" >> $GITHUB_STEP_SUMMARY
         echo "| Clang | ${CLANG_VERSION_SHORT:-unknown} |" >> $GITHUB_STEP_SUMMARY
         echo "| Optimization | ${{ inputs.optimize_level }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| Hook Type | ${{ inputs.hook }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Hook Type | Auto (SUSFS 2.0) |" >> $GITHUB_STEP_SUMMARY
         echo "| LSM (BBG) | ${{ inputs.lsm }} |" >> $GITHUB_STEP_SUMMARY
         echo "| ZRAM | ${{ inputs.enable_zram }} |" >> $GITHUB_STEP_SUMMARY
         echo "| Scheduler | ${{ inputs.sched }} |" >> $GITHUB_STEP_SUMMARY
@@ -1726,4 +1648,4 @@ runs:
         
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "---" >> $GITHUB_STEP_SUMMARY
-        echo "*Built with ❤️ by SukiSU Ultra Action*" >> $GITHUB_STEP_SUMMARY
+        echo "*Built with ❤️ by SukiSU Ultra Action (SUSFS 2.0.0)*" >> $GITHUB_STEP_SUMMARY
