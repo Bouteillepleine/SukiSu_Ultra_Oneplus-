@@ -1308,8 +1308,7 @@ runs:
         echo "============================================"
         echo "::endgroup::"
 
-    - name: 🔧 Apply KPM patch_linux (Optional)
-      if: ${{ inputs.kpm == 'true' }}
+    - name: 🔧 Apply KPM patch_linux    
       shell: bash
       run: |
         set -euo pipefail
