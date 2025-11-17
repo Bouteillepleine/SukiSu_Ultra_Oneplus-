@@ -31,7 +31,7 @@ This repository provides GitHub Actions workflows to automatically build flashab
 Download the latest kernel ZIP for your device from Releases
 Flash the AnyKernel3 ZIP with Kernel Flasher / SukiSU Manager to enable KPM
 Reboot and enjoy!
-⚠️ Warning: Always backup your data before flashing custom kernels. Ensure you have a working recovery and know how to restore your device.
+⚠️ Warning: Always backup your data before flashing custom kernels. 
 
 🔧 Build Artifacts
 Each build produces:
@@ -60,9 +60,6 @@ OnePlusOSS - Official OnePlus kernel sources
 Community contributors - For testing, feedback, and improvements
 
 ⚠️ Disclaimer
-This is unofficial software. Use at your own risk.
-
-The authors are not responsible for any damage to your device
 Always ensure you have a backup and know how to restore your device
-Warranty may be void after unlocking bootloader and flashing custom software
+
 
