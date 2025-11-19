@@ -2200,14 +2200,13 @@ runs:
         
         echo "::endgroup::"
 
-    - name: Upload Build Artifacts
+    - name: 📤 Upload kernel artifact
+      if: success()
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ env.OP_MODEL }}-${{ env.ANDROID_VER }}
-        path: |
-          ${{ env.ARTIFACTS_DIR }}/*.zip
-          ${{ env.ARTIFACTS_DIR }}/build_info.json
+        name: ${{ matrix.model }}-${{ matrix.android_version }}
+        path: ${{ env.ARTIFACTS_DIR }}
         retention-days: 30
         if-no-files-found: error
         compression-level: 6
-        overwrite: false
+
