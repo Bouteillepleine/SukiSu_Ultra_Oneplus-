@@ -2155,3 +2155,59 @@ runs:
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "---" >> $GITHUB_STEP_SUMMARY
         echo "*Built with ❤️ by SukiSU Ultra Action (SUSFS 2.0.0)*" >> $GITHUB_STEP_SUMMARY
+
+    - name: Verify Artifacts Before Upload
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Verify artifacts"
+        
+        echo "📁 Artifacts directory: $ARTIFACTS_DIR"
+        echo ""
+        
+        if [ ! -d "$ARTIFACTS_DIR" ]; then
+          echo "::error::Artifacts directory does not exist: $ARTIFACTS_DIR"
+          exit 1
+        fi
+        
+        echo "📦 Contents of artifacts directory:"
+        ls -lah "$ARTIFACTS_DIR"
+        echo ""
+        
+        ZIP_COUNT=$(find "$ARTIFACTS_DIR" -maxdepth 1 -name "*.zip" -type f | wc -l)
+        if [ "$ZIP_COUNT" -eq 0 ]; then
+          echo "::error::No ZIP file found in artifacts directory"
+          exit 1
+        fi
+        
+        echo "✅ Found $ZIP_COUNT ZIP file(s)"
+        
+        if [ ! -f "$ARTIFACTS_DIR/build_info.json" ]; then
+          echo "::warning::build_info.json not found"
+        else
+          echo "✅ build_info.json found"
+        fi
+        
+        for zip in "$ARTIFACTS_DIR"/*.zip; do
+          if [ -f "$zip" ]; then
+            echo ""
+            echo "ZIP Details:"
+            echo "  Name: $(basename "$zip")"
+            echo "  Size: $(du -h "$zip" | cut -f1)"
+            echo "  SHA256: $(sha256sum "$zip" | awk '{print $1}')"
+          fi
+        done
+        
+        echo "::endgroup::"
+
+    - name: Upload Build Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.OP_MODEL }}-${{ env.ANDROID_VER }}
+        path: |
+          ${{ env.ARTIFACTS_DIR }}/*.zip
+          ${{ env.ARTIFACTS_DIR }}/build_info.json
+        retention-days: 30
+        if-no-files-found: error
+        compression-level: 6
+        overwrite: false
