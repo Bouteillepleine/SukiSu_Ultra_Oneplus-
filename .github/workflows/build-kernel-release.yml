@@ -173,59 +173,37 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          
           echo "::group::Swap configuration"
           
+          # ✅ Désactiver swap existant
           sudo swapoff -a 2>/dev/null || true
-          sudo chattr -i -a /swapfile 2>/dev/null || true
           
-          if [ ! -f /swapfile ]; then
-            if sudo fallocate -l 3G /swapfile 2>/dev/null; then
-              alloc_mb="$(sudo du -m /swapfile | awk '{print $1}')"
-              if [ "${alloc_mb:-0}" -lt 3072 ]; then
-                sudo rm -f /swapfile
-                sudo dd if=/dev/zero of=/swapfile bs=1M count=3072 status=none
-              fi
-            else
-              sudo rm -f /swapfile
-              sudo dd if=/dev/zero of=/swapfile bs=1M count=3072 status=none
-            fi
-            
-            sudo chattr +C /swapfile 2>/dev/null || true
-            sudo chown root:root /swapfile
-            sudo chmod 600 /swapfile
-            sudo mkswap /swapfile >/dev/null
+          # ✅ Supprimer ancien swapfile si existant
+          if [ -f /swapfile ]; then
+            sudo chattr -i /swapfile 2>/dev/null || true
+            sudo rm -f /swapfile
           fi
           
-          sudo swapon /swapfile 2>/dev/null || {
-            sudo mkswap /swapfile >/dev/null
-            sudo swapon /swapfile
-          }
+          # ✅ Créer nouveau swapfile avec fallocate (plus rapide)
+          if ! sudo fallocate -l 3G /swapfile 2>/dev/null; then
+            # Fallback sur dd si fallocate échoue
+            sudo dd if=/dev/zero of=/swapfile bs=1M count=3072 status=progress
+          fi
           
-          sudo chattr +i /swapfile 2>/dev/null || true
+          # ✅ Configuration sécurisée
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile >/dev/null
+          sudo swapon /swapfile
           
-          sudo install -m 0644 /dev/null /etc/sysctl.d/99-swap.conf
-          sudo tee /etc/sysctl.d/99-swap.conf >/dev/null <<'SYSCTL_EOF'
-          vm.swappiness=5
-          vm.vfs_cache_pressure=50
-          SYSCTL_EOF
-          sudo chown root:root /etc/sysctl.d/99-swap.conf
-          sudo sysctl -p /etc/sysctl.d/99-swap.conf >/dev/null
+          # ✅ Optimiser paramètres kernel
+          sudo sysctl -w vm.swappiness=10
+          sudo sysctl -w vm.vfs_cache_pressure=50
           
           echo ""
-          echo "Memory status:"
+          echo "✅ Swap configured:"
           free -h
-          echo ""
-          echo "Swap devices:"
           swapon --show
           
-          if ! swapon --show=NAME | grep -q '^/swapfile$'; then
-            echo "::error::Swap file /swapfile not active"
-            exit 1
-          fi
-          
-          echo ""
-          echo "✅ Swap configured successfully"
           echo "::endgroup::"
 
       - name: 🔨 Build ${{ matrix.model }}
@@ -507,24 +485,52 @@ jobs:
       - name: 🚀 Create GitHub release
         id: release
         run: |
+          set -euo pipefail
           echo "::group::Create release"
           
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "⚠️ Release $TAG already exists, deleting..."
-            gh release delete "$TAG" --yes || true
-            sleep 2
+          # ✅ Vérifier que les ZIPs existent
+          if [ ! -d "release" ] || [ -z "$(ls -A release/*.zip 2>/dev/null)" ]; then
+            echo "::error::No ZIP files found in release directory"
+            exit 1
           fi
           
-          gh release create "$TAG" \
-            --title "🎯 OnePlus Kernels - SukiSU Ultra $TAG (SUSFS 2.0.0)" \
-            --notes-file notes.md \
-            --prerelease \
-            release/*.zip
+          # ✅ Supprimer release existante si présente
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "⚠️ Release $TAG already exists, deleting..."
+            gh release delete "$TAG" --yes --cleanup-tag || true
+            sleep 3
+          fi
           
-          echo "✅ Release created: $TAG"
-          echo "🔗 URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG"
+          # ✅ Créer la release avec retry
+          max_attempts=3
+          attempt=1
           
-          echo "release_url=${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG" >> $GITHUB_OUTPUT
+          while [ $attempt -le $max_attempts ]; do
+            echo "Attempt $attempt/$max_attempts..."
+            
+            if gh release create "$TAG" \
+              --title "🎯 OnePlus Kernels - SukiSU Ultra $TAG (SUSFS 2.0.0)" \
+              --notes-file notes.md \
+              --prerelease \
+              release/*.zip; then
+              
+              echo "✅ Release created successfully"
+              break
+            else
+              if [ $attempt -eq $max_attempts ]; then
+                echo "::error::Failed to create release after $max_attempts attempts"
+                exit 1
+              fi
+              
+              echo "⚠️ Attempt $attempt failed, retrying in 5s..."
+              sleep 5
+              attempt=$((attempt + 1))
+            fi
+          done
+          
+          release_url="${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG"
+          echo "🔗 Release URL: $release_url"
+          echo "release_url=$release_url" >> $GITHUB_OUTPUT
           
           echo "::endgroup::"
 
@@ -593,29 +599,51 @@ jobs:
             const ms = days * 24 * 60 * 60 * 1000;
             const cutoff = new Date(Date.now() - ms);
             
-            console.log(`Cleaning artifacts older than ${days} days (before ${cutoff.toISOString()})`);
+            console.log(`🧹 Cleaning artifacts older than ${days} days`);
+            console.log(`Cutoff date: ${cutoff.toISOString()}`);
             
-            const artifacts = await github.rest.actions.listArtifactsForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              per_page: 100
-            });
-            
+            let page = 1;
             let deleted = 0;
-            for (const artifact of artifacts.data.artifacts) {
-              const createdAt = new Date(artifact.created_at);
-              if (createdAt < cutoff) {
-                console.log(`Deleting: ${artifact.name} (${artifact.created_at})`);
-                await github.rest.actions.deleteArtifact({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  artifact_id: artifact.id
-                });
-                deleted++;
+            let total = 0;
+            
+            while (true) {
+              const artifacts = await github.rest.actions.listArtifactsForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+                page: page
+              });
+              
+              if (artifacts.data.artifacts.length === 0) break;
+              
+              for (const artifact of artifacts.data.artifacts) {
+                total++;
+                const createdAt = new Date(artifact.created_at);
+                
+                if (createdAt < cutoff) {
+                  console.log(`❌ Deleting: ${artifact.name} (${artifact.created_at})`);
+                  try {
+                    await github.rest.actions.deleteArtifact({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      artifact_id: artifact.id
+                    });
+                    deleted++;
+                  } catch (error) {
+                    console.log(`⚠️ Failed to delete ${artifact.name}: ${error.message}`);
+                  }
+                } else {
+                  console.log(`✅ Keeping: ${artifact.name} (${artifact.created_at})`);
+                }
               }
+              
+              page++;
             }
             
-            console.log(`✅ Deleted ${deleted} old artifact(s)`);
+            console.log(`\n📊 Summary:`);
+            console.log(`  Total artifacts: ${total}`);
+            console.log(`  Deleted: ${deleted}`);
+            console.log(`  Remaining: ${total - deleted}`);
 
       - name: 📊 Cleanup summary
         run: |
