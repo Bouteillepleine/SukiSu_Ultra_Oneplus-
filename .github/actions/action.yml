@@ -1315,6 +1315,73 @@ runs:
         echo "✅ Kernel branding: $CUSTOM_LOCALVERSION"
         echo "::endgroup::"
 
+    - name: 🔧 Apply F2FS patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Patch F2FS sysfs"
+        
+        KERNEL_PATH="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
+        COMMON="$KERNEL_PATH/common"
+        F2FS_SYSFS="$COMMON/fs/f2fs/sysfs.c"
+        
+        if [ ! -f "$F2FS_SYSFS" ]; then
+          echo "::warning::F2FS sysfs.c not found, skipping patch"
+          echo "::endgroup::"
+          exit 0
+        fi
+        
+        # Check if patch is needed
+        if grep -q "seqzone_switch" "$F2FS_SYSFS" 2>/dev/null; then
+          echo "🔧 Patching F2FS sysfs.c for seqzone_switch bug..."
+          
+          # Create patch
+          cat > /tmp/f2fs_sysfs.patch << 'PATCH'
+          --- a/fs/f2fs/sysfs.c
+          +++ b/fs/f2fs/sysfs.c
+          @@ -984,10 +984,7 @@ static ssize_t f2fs_sb_feature_show(struct f2fs_attr *a,
+           		return sysfs_emit(buf, "supported\n");
+           	}
+           
+          -	if (!seqzone_switch)
+          -		return 0;
+          -
+          -	return sysfs_emit(buf, seqzone_switch);
+          +	return sysfs_emit(buf, "supported\n");
+           }
+           
+           #define F2FS_ATTR_OFFSET(_struct_type, _name, _mode, _show, _store, _offset) \
+          PATCH
+          
+          # Apply patch
+          cd "$COMMON"
+          if patch -p1 --dry-run < /tmp/f2fs_sysfs.patch >/dev/null 2>&1; then
+            patch -p1 < /tmp/f2fs_sysfs.patch
+            echo "✅ F2FS patch applied successfully"
+          else
+            echo "⚠️ Patch failed to apply, trying sed fallback..."
+            
+            # Fallback: direct sed replacement
+            sed -i '987,990d' "$F2FS_SYSFS"
+            sed -i '986 a\	return sysfs_emit(buf, "supported\\n");' "$F2FS_SYSFS"
+            
+            echo "✅ F2FS patched with sed fallback"
+          fi
+          
+          # Verify fix
+          if grep -q "seqzone_switch" "$F2FS_SYSFS"; then
+            echo "::error::Failed to remove seqzone_switch references"
+            exit 1
+          fi
+          
+          echo ""
+          echo "✅ Verification passed - seqzone_switch removed"
+        else
+          echo "ℹ️  F2FS sysfs.c does not contain seqzone_switch, no patch needed"
+        fi
+        
+        echo "::endgroup::"
+
     - name: Build Kernel
       shell: bash
       env:
