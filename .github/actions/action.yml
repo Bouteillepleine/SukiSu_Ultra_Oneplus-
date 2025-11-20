@@ -1419,7 +1419,6 @@ runs:
         echo "============================================"
         
         # ⚡ OPTIMIZATION: Skip gki_defconfig if .config exists and defconfig unchanged
-        # This preserves incremental build benefits
         if [ ! -f "$OUT/.config" ]; then
           echo "🔨 Generating initial .config from gki_defconfig..."
           make O="$OUT" gki_defconfig
@@ -1446,6 +1445,14 @@ runs:
         for sym in "${disable_list[@]}"; do
           scripts/config --file "$OUT/.config" -d "$sym" || true
         done
+        
+        # ⚡ FIX: Disable KVM to avoid RELA type 311 error with Clang
+        echo "🔧 Disabling KVM (not needed for OnePlus devices)..."
+        scripts/config --file "$OUT/.config" -d CONFIG_KVM || true
+        scripts/config --file "$OUT/.config" -d CONFIG_VIRTUALIZATION || true
+        scripts/config --file "$OUT/.config" -d CONFIG_KVM_ARM_HOST || true
+        scripts/config --file "$OUT/.config" -d CONFIG_VHOST_NET || true
+        scripts/config --file "$OUT/.config" -d CONFIG_VHOST_CROSS_ENDIAN_LEGACY || true
         
         # ⚡ OPTIMIZATION: -fno-plt for better performance
         if [ "${{ inputs.optimize_level }}" = "O3" ]; then
