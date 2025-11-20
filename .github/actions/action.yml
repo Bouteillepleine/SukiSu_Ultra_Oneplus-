@@ -486,7 +486,7 @@ runs:
         ANYKERNEL_BRANCH="gki-2.0"
         echo "Cloning AnyKernel3 (branch: $ANYKERNEL_BRANCH)..."
         git clone --depth=1 https://github.com/Bouteillepleine/AnyKernel3.git -b "$ANYKERNEL_BRANCH"
-        git clone --depth=1 https://github.com/TheWildJames/kernel_patches.git &
+        git clone --depth=1 https://github.com/TheWildJames/kernel_patches.git
         echo "✅ AnyKernel3 & kernel patches cloned"
         echo "::endgroup::"
 
@@ -862,23 +862,129 @@ runs:
       run: |
         set -euo pipefail
         echo "::group::Apply Other Patches"
+        
         cd "$CONFIG/kernel_platform/common"
         
-        # ✅ AJOUT : Définir les variables manquantes
+        # ✅ CORRECTION : MIN_VERSION = 5.16 (PAS 6.6 !)
         KERNEL_VERSION="${{ env.KERNEL_VER }}"
-        MIN_VERSION="6.6"  # ou la version minimale requise
+        MIN_VERSION="5.16"
+        PATCH_DIR="$GITHUB_WORKSPACE/kernel_patches/common"
         
-        patch -p1 --forward "../../../kernel_patches/common/optimized_mem_operations.patch"
-        patch -p1 --forward "../../../kernel_patches/common/file_struct_8bytes_align.patch"
-        patch -p1 --forward "../../../kernel_patches/common/reduce_cache_pressure.patch"
+        echo "📋 Patch Configuration:"
+        echo "   Kernel version: $KERNEL_VERSION"
+        echo "   Threshold version: $MIN_VERSION"
+        echo "   Patch directory: $PATCH_DIR"
+        echo "   Working directory: $(pwd)"
+        echo ""
         
-        if [ "$(printf '%s\n' "$KERNEL_VERSION" "$MIN_VERSION" | sort -V | head -n1)" = "$KERNEL_VERSION" ]; then
-          patch -p1 --forward "../../../kernel_patches/common/clear_page_16bytes_align.patch"
-        else
-          cat "../../../kernel_patches/common/clear_page_16bytes_align.patch" | \
-            sed -e 's/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/' | \
-            patch -p1 -F3 --forward
+        # ========================================
+        # Vérifications Préliminaires
+        # ========================================
+        
+        if [ ! -d "$PATCH_DIR" ]; then
+          echo "::error::Patch directory not found: $PATCH_DIR"
+          echo "Available directories:"
+          ls -la "$GITHUB_WORKSPACE/" 2>/dev/null || true
+          exit 1
         fi
+        
+        echo "✅ Patch directory found"
+        echo ""
+        
+        # ========================================
+        # Patches Universels
+        # ========================================
+        
+        PATCHES=(
+          "optimized_mem_operations.patch"
+          "file_struct_8bytes_align.patch"
+          "reduce_cache_pressure.patch"
+        )
+        
+        echo "🔧 Applying universal patches..."
+        echo ""
+        
+        for patch_file in "${PATCHES[@]}"; do
+          patch_path="$PATCH_DIR/$patch_file"
+          
+          if [ ! -f "$patch_path" ]; then
+            echo "::error::Patch not found: $patch_file"
+            echo "Expected: $patch_path"
+            ls -la "$PATCH_DIR/" 2>/dev/null || true
+            exit 1
+          fi
+          
+          echo "📄 Applying: $patch_file"
+          if patch -p1 --forward --dry-run < "$patch_path" >/dev/null 2>&1; then
+            if patch -p1 --forward < "$patch_path"; then
+              echo "   ✅ Applied successfully"
+            else
+              echo "   ⚠️ Applied with warnings"
+            fi
+          else
+            echo "   ℹ️ Already applied, skipping"
+          fi
+          echo ""
+        done
+        
+        # ========================================
+        # Patch Conditionnel : clear_page_16bytes_align
+        # ========================================
+        
+        CLEAR_PAGE_PATCH="$PATCH_DIR/clear_page_16bytes_align.patch"
+        
+        echo "🔧 Applying version-specific patch..."
+        echo ""
+        
+        if [ ! -f "$CLEAR_PAGE_PATCH" ]; then
+          echo "::warning::clear_page_16bytes_align.patch not found, skipping"
+        else
+          echo "📄 Applying: clear_page_16bytes_align.patch"
+          echo ""
+          echo "   ℹ️ Version-dependent behavior:"
+          echo "   • Kernel < 5.16: uses SYM_FUNC_START_PI(clear_page)"
+          echo "   • Kernel ≥ 5.16: uses SYM_FUNC_START_PI(__pi_clear_page)"
+          echo ""
+          
+          # Comparer versions
+          if [ "$(printf '%s\n' "$KERNEL_VERSION" "$MIN_VERSION" | sort -V | head -n1)" = "$KERNEL_VERSION" ]; then
+            # Kernel < 5.16
+            echo "   📌 Detected: Kernel $KERNEL_VERSION < $MIN_VERSION"
+            echo "   → Applying patch directly (symbol: clear_page)"
+            echo ""
+            
+            if patch -p1 --forward --dry-run < "$CLEAR_PAGE_PATCH" >/dev/null 2>&1; then
+              if patch -p1 --forward < "$CLEAR_PAGE_PATCH"; then
+                echo "   ✅ Applied successfully"
+              else
+                echo "   ⚠️ Applied with warnings"
+              fi
+            else
+              echo "   ℹ️ Already applied or not applicable"
+            fi
+            
+          else
+            # Kernel ≥ 5.16
+            echo "   📌 Detected: Kernel $KERNEL_VERSION ≥ $MIN_VERSION"
+            echo "   → Applying with modification (clear_page → __pi_clear_page)"
+            echo ""
+            
+            if sed -e 's/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/' "$CLEAR_PAGE_PATCH" | \
+               patch -p1 -F3 --forward --dry-run >/dev/null 2>&1; then
+              if sed -e 's/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/' "$CLEAR_PAGE_PATCH" | \
+                 patch -p1 -F3 --forward; then
+                echo "   ✅ Applied successfully (modified)"
+              else
+                echo "   ⚠️ Applied with warnings (modified)"
+              fi
+            else
+              echo "   ℹ️ Already applied or not applicable"
+            fi
+          fi
+        fi
+        
+        echo ""
+        echo "✅ Other patches applied successfully"
         echo "::endgroup::"
 
     - name: Apply ZRAM Patches
