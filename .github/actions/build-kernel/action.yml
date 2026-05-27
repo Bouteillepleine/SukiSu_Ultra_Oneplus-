@@ -1257,19 +1257,168 @@ runs:
 
             echo "Checking leftover SukiSU KernelSU-side reject files..."
 
-            if [ -n "$(find . -name '*.rej' -print -quit)" ]; then
-              echo "Found KernelSU-side .rej files; dumping known SukiSU/SUSFS rejects:"
-              find . -name '*.rej' -exec echo "=== {} ===" \; -exec cat {} \; || true
+            EXPECTED_SUKISU_REJECTS=(
+              "kernel/core/init.c.rej"
+              "kernel/feature/selinux_hide.c.rej"
+              "kernel/runtime/boot_event.c.rej"
+            )
 
-              rm -f kernel/core/init.c.rej
-              rm -f kernel/feature/selinux_hide.c.rej
-              rm -f kernel/runtime/boot_event.c.rej
+            if [ -n "$(find . -name '*.rej' -print -quit)" ]; then
+              echo "Found KernelSU-side .rej files:"
+              find . -name '*.rej' -print
+
+              for rej in "${EXPECTED_SUKISU_REJECTS[@]}"; do
+                if [ -f "$rej" ]; then
+                  echo "Accepting expected SukiSU/SUSFS reject: $rej"
+                  rm -f "$rej"
+                fi
+              done
             fi
 
             if [ -n "$(find . -name '*.rej' -print -quit)" ]; then
               echo "::error::Unexpected KernelSU-side .rej files remain:"
               find . -name '*.rej' -print
               exit 1
+            fi
+
+            echo "Applying direct SukiSU source compatibility fixes..."
+
+            # --------------------------------------------------------------
+            # kernel/core/init.c cleanup
+            # --------------------------------------------------------------
+
+            if [ -f kernel/core/init.c ]; then
+              echo "Fixing SukiSU source kernel/core/init.c..."
+
+              sed -i '/ksu_lsm_hook_init\s*();/d' kernel/core/init.c || true
+
+              sed -i \
+                -e 's/\bksu_syscall_hook_manager_init\s*(/ksu_syscall_hook_init(/g' \
+                -e 's/\bksu_syscall_hook_manager_exit\s*(/ksu_syscall_hook_exit(/g' \
+                kernel/core/init.c || true
+
+              sed -i \
+                -e 's/if[[:space:]]*(ksu_late_loaded)[[:space:]]*{/if (0) {/' \
+                -e 's/if[[:space:]]*(!ksu_late_loaded)/if (1)/' \
+                kernel/core/init.c || true
+
+              if ! grep -Rqs '^[[:space:]]*\(void\|int\)[[:space:]]\+ksu_syscall_hook_init[[:space:]]*(' \
+                kernel --include='*.c' 2>/dev/null; then
+                sed -i '/ksu_syscall_hook_init\s*();/d' kernel/core/init.c || true
+              fi
+
+              if ! grep -Rqs '^[[:space:]]*\(void\|int\)[[:space:]]\+ksu_syscall_hook_exit[[:space:]]*(' \
+                kernel --include='*.c' 2>/dev/null; then
+                sed -i '/ksu_syscall_hook_exit\s*();/d' kernel/core/init.c || true
+              fi
+
+              if grep -nE 'ksu_lsm_hook_init|ksu_late_loaded|ksu_syscall_hook_manager_init|ksu_syscall_hook_manager_exit' \
+                kernel/core/init.c; then
+                echo "::error::Legacy SukiSU-incompatible symbols still remain in kernel/core/init.c"
+                exit 1
+              fi
+
+              echo "✅ Fixed kernel/core/init.c"
+            fi
+
+            # --------------------------------------------------------------
+            # kernel/runtime/boot_event.c cleanup
+            # --------------------------------------------------------------
+
+            if [ -f kernel/runtime/boot_event.c ]; then
+              echo "Fixing SukiSU source kernel/runtime/boot_event.c..."
+
+              if grep -q 'ksu_stop_input_hook_runtime[[:space:]]*();' kernel/runtime/boot_event.c; then
+                awk '
+                  {
+                    if ($0 ~ /^[[:space:]]*ksu_stop_input_hook_runtime[[:space:]]*\(\);/) {
+                      indent = $0
+                      sub(/ksu_stop_input_hook_runtime.*/, "", indent)
+
+                      print indent "if (static_key_enabled(&ksu_is_input_hook_enabled)) {"
+                      print indent "    static_branch_disable(&ksu_is_input_hook_enabled);"
+                      print indent "    pr_info(\"ksu_input_hook is disabled\\n\");"
+                      print indent "}"
+                      next
+                    }
+
+                    print
+                  }
+                ' kernel/runtime/boot_event.c > kernel/runtime/boot_event.c.tmp
+
+                mv kernel/runtime/boot_event.c.tmp kernel/runtime/boot_event.c
+
+                echo "✅ Replaced ksu_stop_input_hook_runtime() in kernel/runtime/boot_event.c"
+              else
+                echo "ℹ️ ksu_stop_input_hook_runtime() not found in kernel/runtime/boot_event.c"
+              fi
+
+              grep -q '#include <linux/jump_label.h>' kernel/runtime/boot_event.c || \
+                sed -i '1i#include <linux/jump_label.h>' kernel/runtime/boot_event.c
+
+              if grep -q 'ksu_is_input_hook_enabled' kernel/runtime/boot_event.c && \
+                 ! grep -q 'extern struct static_key_true ksu_is_input_hook_enabled' kernel/runtime/boot_event.c && \
+                 ! grep -q 'extern struct static_key_false ksu_is_input_hook_enabled' kernel/runtime/boot_event.c; then
+                sed -i '/#include <linux\/jump_label.h>/a extern struct static_key_true ksu_is_input_hook_enabled;' \
+                  kernel/runtime/boot_event.c
+              fi
+
+              if grep -n 'ksu_stop_input_hook_runtime' kernel/runtime/boot_event.c; then
+                echo "::error::ksu_stop_input_hook_runtime still remains in kernel/runtime/boot_event.c"
+                exit 1
+              fi
+
+              echo "✅ Fixed kernel/runtime/boot_event.c"
+            fi
+
+            # --------------------------------------------------------------
+            # kernel/feature/selinux_hide.c cleanup
+            # --------------------------------------------------------------
+
+            if [ -f kernel/feature/selinux_hide.c ]; then
+              echo "Applying SukiSU source kernel/feature/selinux_hide.c compatibility fixes..."
+
+              sed -i \
+                -e 's/^static int security_context_to_sid_with_policy(/int security_context_to_sid_with_policy(/' \
+                -e 's/^static int security_sid_to_context_with_policy(/int security_sid_to_context_with_policy(/' \
+                -e 's/^static void security_compute_av_user_with_policy(/void security_compute_av_user_with_policy(/' \
+                kernel/feature/selinux_hide.c || true
+
+              sed -i \
+                's/^static bool ksu_selinux_hide_running/bool ksu_selinux_hide_running/' \
+                kernel/feature/selinux_hide.c || true
+
+              if grep -q "backup_sepolicy" kernel/feature/selinux_hide.c && \
+                 ! grep -q "struct selinux_policy \*backup_sepolicy" kernel/feature/selinux_hide.c; then
+                awk '
+                  /^#include/ {
+                    print
+                    last_include = NR
+                    next
+                  }
+
+                  last_include && !inserted {
+                    print ""
+                    print "static struct selinux_policy *backup_sepolicy;"
+                    print ""
+                    inserted = 1
+                  }
+
+                  { print }
+
+                  END {
+                    if (!inserted) {
+                      print ""
+                      print "static struct selinux_policy *backup_sepolicy;"
+                    }
+                  }
+                ' kernel/feature/selinux_hide.c > kernel/feature/selinux_hide.c.tmp
+
+                mv kernel/feature/selinux_hide.c.tmp kernel/feature/selinux_hide.c
+                echo "✅ Injected backup_sepolicy declaration"
+              fi
+
+              echo "✅ Fixed kernel/feature/selinux_hide.c"
             fi
 
             echo "✅ SukiSU Ultra SUSFS integration patch handled"
@@ -1296,7 +1445,7 @@ runs:
         cd "$COMMON_KERNEL_FOLDER"
 
         # ------------------------------------------------------------------
-        # KSUN / SukiSU Ultra compatibility fixes
+        # KSUN / SukiSU Ultra compatibility fixes after KernelSU copy/integration
         # ------------------------------------------------------------------
 
         if [ "$KSU_TYPE" = "KSUN" ] || [ "$KSU_TYPE" = "SUKISU" ]; then
@@ -1332,14 +1481,14 @@ runs:
           fi
 
           if [ "$KSU_TYPE" = "SUKISU" ]; then
-            echo "Applying SukiSU Ultra-specific fixes..."
+            echo "Applying SukiSU Ultra-specific fixes in common kernel tree..."
 
             # --------------------------------------------------------------
-            # Fix SukiSU Ultra core/init.c symbols left by SUSFS integration
+            # drivers/kernelsu/core/init.c cleanup
             # --------------------------------------------------------------
 
             if [ -f drivers/kernelsu/core/init.c ]; then
-              echo "Applying SukiSU Ultra core/init.c legacy symbol cleanup..."
+              echo "Applying SukiSU Ultra drivers/kernelsu/core/init.c legacy symbol cleanup..."
 
               if [ -f drivers/kernelsu/hook/syscall_hook.h ]; then
                 grep -q 'hook/syscall_hook.h' drivers/kernelsu/core/init.c || \
@@ -1347,31 +1496,31 @@ runs:
                     drivers/kernelsu/core/init.c
               fi
 
-              sed -i '/ksu_lsm_hook_init\s*();/d' drivers/kernelsu/core/init.c
+              sed -i '/ksu_lsm_hook_init\s*();/d' drivers/kernelsu/core/init.c || true
 
               sed -i \
                 -e 's/\bksu_syscall_hook_manager_init\s*(/ksu_syscall_hook_init(/g' \
                 -e 's/\bksu_syscall_hook_manager_exit\s*(/ksu_syscall_hook_exit(/g' \
-                drivers/kernelsu/core/init.c
+                drivers/kernelsu/core/init.c || true
 
               sed -i \
                 -e 's/if[[:space:]]*(ksu_late_loaded)[[:space:]]*{/if (0) {/' \
                 -e 's/if[[:space:]]*(!ksu_late_loaded)/if (1)/' \
-                drivers/kernelsu/core/init.c
+                drivers/kernelsu/core/init.c || true
 
               if ! grep -Rqs '^[[:space:]]*\(void\|int\)[[:space:]]\+ksu_syscall_hook_init[[:space:]]*(' \
                 drivers/kernelsu --include='*.c' 2>/dev/null; then
-                sed -i '/ksu_syscall_hook_init\s*();/d' drivers/kernelsu/core/init.c
+                sed -i '/ksu_syscall_hook_init\s*();/d' drivers/kernelsu/core/init.c || true
                 echo "  - Removed orphan ksu_syscall_hook_init() call"
               fi
 
               if ! grep -Rqs '^[[:space:]]*\(void\|int\)[[:space:]]\+ksu_syscall_hook_exit[[:space:]]*(' \
                 drivers/kernelsu --include='*.c' 2>/dev/null; then
-                sed -i '/ksu_syscall_hook_exit\s*();/d' drivers/kernelsu/core/init.c
+                sed -i '/ksu_syscall_hook_exit\s*();/d' drivers/kernelsu/core/init.c || true
                 echo "  - Removed orphan ksu_syscall_hook_exit() call"
               fi
 
-              echo "Verifying SukiSU Ultra core/init.c cleanup..."
+              echo "Verifying SukiSU Ultra drivers/kernelsu/core/init.c cleanup..."
 
               if grep -nE 'ksu_lsm_hook_init|ksu_late_loaded|ksu_syscall_hook_manager_init|ksu_syscall_hook_manager_exit' \
                 drivers/kernelsu/core/init.c; then
@@ -1379,15 +1528,15 @@ runs:
                 exit 1
               fi
 
-              echo "✅ SukiSU Ultra core/init.c legacy symbol cleanup applied"
+              echo "✅ SukiSU Ultra drivers/kernelsu/core/init.c legacy symbol cleanup applied"
             fi
 
             # --------------------------------------------------------------
-            # Fix SukiSU Ultra runtime/boot_event.c input hook mismatch
+            # drivers/kernelsu/runtime/boot_event.c cleanup
             # --------------------------------------------------------------
 
             if [ -f drivers/kernelsu/runtime/boot_event.c ]; then
-              echo "Applying SukiSU Ultra runtime/boot_event.c input hook cleanup..."
+              echo "Applying SukiSU Ultra drivers/kernelsu/runtime/boot_event.c input hook cleanup..."
 
               if grep -q 'ksu_stop_input_hook_runtime[[:space:]]*();' drivers/kernelsu/runtime/boot_event.c; then
                 awk '
@@ -1409,9 +1558,9 @@ runs:
 
                 mv drivers/kernelsu/runtime/boot_event.c.tmp drivers/kernelsu/runtime/boot_event.c
 
-                echo "✅ Replaced ksu_stop_input_hook_runtime() with static key disable block"
+                echo "✅ Replaced ksu_stop_input_hook_runtime() in drivers/kernelsu/runtime/boot_event.c"
               else
-                echo "ℹ️ ksu_stop_input_hook_runtime() not found; boot_event.c likely already compatible"
+                echo "ℹ️ ksu_stop_input_hook_runtime() not found in drivers/kernelsu/runtime/boot_event.c"
               fi
 
               grep -q '#include <linux/jump_label.h>' drivers/kernelsu/runtime/boot_event.c || \
@@ -1424,14 +1573,14 @@ runs:
                   drivers/kernelsu/runtime/boot_event.c
               fi
 
-              echo "Verifying SukiSU Ultra runtime/boot_event.c cleanup..."
+              echo "Verifying SukiSU Ultra drivers/kernelsu/runtime/boot_event.c cleanup..."
 
               if grep -n 'ksu_stop_input_hook_runtime' drivers/kernelsu/runtime/boot_event.c; then
                 echo "::error::ksu_stop_input_hook_runtime still remains in drivers/kernelsu/runtime/boot_event.c"
                 exit 1
               fi
 
-              echo "✅ SukiSU Ultra runtime/boot_event.c input hook cleanup applied"
+              echo "✅ SukiSU Ultra drivers/kernelsu/runtime/boot_event.c input hook cleanup applied"
             fi
 
             # --------------------------------------------------------------
@@ -1462,14 +1611,24 @@ runs:
             fi
 
             # --------------------------------------------------------------
-            # Fix SukiSU Ultra selinux_hide.c backup_sepolicy declaration
+            # drivers/kernelsu/feature/selinux_hide.c cleanup
             # --------------------------------------------------------------
 
             if [ -f drivers/kernelsu/feature/selinux_hide.c ]; then
-              echo "Applying SukiSU Ultra selinux_hide backup_sepolicy fix..."
+              echo "Applying SukiSU Ultra drivers/kernelsu/feature/selinux_hide.c fixes..."
+
+              sed -i \
+                -e 's/^static int security_context_to_sid_with_policy(/int security_context_to_sid_with_policy(/' \
+                -e 's/^static int security_sid_to_context_with_policy(/int security_sid_to_context_with_policy(/' \
+                -e 's/^static void security_compute_av_user_with_policy(/void security_compute_av_user_with_policy(/' \
+                drivers/kernelsu/feature/selinux_hide.c || true
+
+              sed -i \
+                's/^static bool ksu_selinux_hide_running/bool ksu_selinux_hide_running/' \
+                drivers/kernelsu/feature/selinux_hide.c || true
 
               if grep -q "backup_sepolicy" drivers/kernelsu/feature/selinux_hide.c && \
-                 ! grep -q "static struct selinux_policy \*backup_sepolicy" drivers/kernelsu/feature/selinux_hide.c; then
+                 ! grep -q "struct selinux_policy \*backup_sepolicy" drivers/kernelsu/feature/selinux_hide.c; then
 
                 awk '
                   /^#include/ {
@@ -1541,7 +1700,7 @@ runs:
 
             if grep -q "KERNEL_SU_VERSION" drivers/kernelsu/supercall/dispatch.c 2>/dev/null; then
               grep -q "#define KERNEL_SU_VERSION" drivers/kernelsu/supercall/dispatch.c || \
-                sed -i '1i\#ifndef KERNEL_SU_VERSION\n#define KERNEL_SU_VERSION 40754\n#endif' \
+                sed -i '1i\#ifndef KERNEL_SU_VERSION\n#define KERNEL_SU_VERSION 40787\n#endif' \
                   drivers/kernelsu/supercall/dispatch.c
             fi
 
