@@ -1309,6 +1309,38 @@ runs:
           echo "✅ Fixed $target"
         }
 
+        fix_sukisu_ksud_integration_c() {
+          local target="$1"
+
+          [ -f "$target" ] || return 0
+
+          echo "Fixing SukiSU ksud_integration file: $target"
+
+          if ! grep -q 'ksu_no_custom_rc' "$target"; then
+            echo "ℹ️ ksu_no_custom_rc not referenced in $target"
+            return 0
+          fi
+
+          if grep -qE '^[[:space:]]*(extern[[:space:]]+)?bool[[:space:]]+ksu_no_custom_rc\b|^[[:space:]]*static[[:space:]]+bool[[:space:]]+ksu_no_custom_rc\b' "$target"; then
+            echo "✅ ksu_no_custom_rc already declared in $target"
+            return 0
+          fi
+
+          local root_dir
+          root_dir="$(dirname "$(dirname "$target")")"
+
+          if grep -RqsE '^[[:space:]]*bool[[:space:]]+ksu_no_custom_rc\b|^[[:space:]]*static[[:space:]]+bool[[:space:]]+ksu_no_custom_rc\b' \
+            "$root_dir" --include='*.c' --include='*.h' 2>/dev/null; then
+            grep -q '#include <linux/types.h>' "$target" || sed -i '1i#include <linux/types.h>' "$target"
+            sed -i '/#include <linux\/types.h>/a extern bool ksu_no_custom_rc;' "$target"
+            echo "✅ Added extern bool ksu_no_custom_rc to $target"
+          else
+            grep -q '#include <linux/types.h>' "$target" || sed -i '1i#include <linux/types.h>' "$target"
+            sed -i '/#include <linux\/types.h>/a static bool ksu_no_custom_rc = false;' "$target"
+            echo "✅ Added local static bool ksu_no_custom_rc = false to $target"
+          fi
+        }
+
         fix_sukisu_selinux_hide_c() {
           local target="$1"
 
@@ -1627,6 +1659,7 @@ runs:
 
             fix_sukisu_init_c "kernel/core/init.c"
             fix_sukisu_boot_event_c "kernel/runtime/boot_event.c"
+            fix_sukisu_ksud_integration_c "kernel/runtime/ksud_integration.c"
             fix_sukisu_selinux_hide_c "kernel/feature/selinux_hide.c"
             fix_sukisu_linker_symbols
 
@@ -1694,6 +1727,7 @@ runs:
 
             fix_sukisu_init_c "drivers/kernelsu/core/init.c"
             fix_sukisu_boot_event_c "drivers/kernelsu/runtime/boot_event.c"
+            fix_sukisu_ksud_integration_c "drivers/kernelsu/runtime/ksud_integration.c"
             fix_sukisu_selinux_hide_c "drivers/kernelsu/feature/selinux_hide.c"
             fix_sukisu_linker_symbols
 
@@ -1841,6 +1875,18 @@ runs:
 
         echo "Applying SUSFS kernel patch..."
 
+        SELINUXFS_REL="security/selinux/selinuxfs.c"
+        SELINUXFS_PATH="$COMMON_KERNEL_FOLDER/$SELINUXFS_REL"
+        SELINUXFS_BACKUP=""
+
+        if [ -f "$SELINUXFS_PATH" ]; then
+          SELINUXFS_BACKUP="${RUNNER_TEMP:-/tmp}/selinuxfs.c.before_susfs.$$"
+          cp -a "$SELINUXFS_PATH" "$SELINUXFS_BACKUP"
+          echo "✅ Backed up $SELINUXFS_REL before SUSFS patch"
+        else
+          echo "⚠️ $SELINUXFS_REL not found before SUSFS patch"
+        fi
+
         SUSFS_PATCH="$SUSFS_FOLDER/kernel_patches/50_add_susfs_in_${SUSFS_KERNEL_BRANCH_LOCAL}.patch"
 
         if [ ! -f "$SUSFS_PATCH" ]; then
@@ -1930,27 +1976,40 @@ runs:
         if [ "$ANDROID_VER_LOCAL" = "android16" ] && [ "$KERNEL_VER_LOCAL" = "6.12" ]; then
           SELINUXFS="$COMMON_KERNEL_FOLDER/security/selinux/selinuxfs.c"
 
-          if [ -f "$SELINUXFS" ]; then
-            echo "🩹 Restoring original SELinuxFS file for android16-6.12 SUSFS compatibility..."
+          if [ -f "$SELINUXFS" ] && [ -n "${SELINUXFS_BACKUP:-}" ] && [ -f "$SELINUXFS_BACKUP" ]; then
+            echo "🩹 Restoring original SELinuxFS file from backup for android16-6.12 SUSFS compatibility..."
 
-            cd "$COMMON_KERNEL_FOLDER"
-            git restore "security/selinux/selinuxfs.c" || git checkout HEAD -- "security/selinux/selinuxfs.c"
+            cp -a "$SELINUXFS_BACKUP" "$SELINUXFS"
 
-            echo "✅ Restored security/selinux/selinuxfs.c"
+            echo "✅ Restored security/selinux/selinuxfs.c from pre-SUSFS backup"
 
             echo "🔎 Remaining unresolved-symbol references:"
             grep -RInE 'ksu_selinux_hide_enabled|fake_status|initialize_fake_status|fake_status_initialize_key|my_sel_open_handle_status' \
-              "security/selinux/selinuxfs.c" || true
+              "$SELINUXFS" || true
 
             echo "🔎 Checking orphan CONFIG_KSU_SUSFS endif:"
             grep -nE '#endif.*CONFIG_KSU_SUSFS' \
-              "security/selinux/selinuxfs.c" || true
+              "$SELINUXFS" || true
 
             echo "🔎 sel_handle_status excerpt:"
             grep -nE 'sel_open_handle_status|sel_handle_status_ops' \
-              "security/selinux/selinuxfs.c" || true
+              "$SELINUXFS" || true
           else
-            echo "⚠️ SELinuxFS file not found, skipping restore"
+            echo "⚠️ SELinuxFS backup unavailable, doing token cleanup fallback"
+
+            if [ -f "$SELINUXFS" ]; then
+              sed -i \
+                -e '/ksu_selinux_hide_enabled/d' \
+                -e '/fake_status/d' \
+                -e '/initialize_fake_status/d' \
+                -e '/fake_status_initialize_key/d' \
+                -e 's/my_sel_open_handle_status/sel_open_handle_status/g' \
+                "$SELINUXFS" || true
+
+              echo "✅ Applied fallback SELinuxFS token cleanup"
+            else
+              echo "⚠️ SELinuxFS file not found, skipping restore"
+            fi
           fi
         fi
 
@@ -1987,6 +2046,14 @@ runs:
           if [ -f drivers/kernelsu/supercall/dispatch.c ]; then
             if grep -nE 'ksu_set_spoof_version[[:space:]]*\(' drivers/kernelsu/supercall/dispatch.c; then
               echo "::error::ksu_set_spoof_version call still exists in drivers/kernelsu/supercall/dispatch.c"
+              exit 1
+            fi
+          fi
+
+          if [ -f drivers/kernelsu/runtime/ksud_integration.c ]; then
+            if grep -q 'ksu_no_custom_rc' drivers/kernelsu/runtime/ksud_integration.c && \
+               ! grep -qE '^[[:space:]]*(extern[[:space:]]+)?bool[[:space:]]+ksu_no_custom_rc\b|^[[:space:]]*static[[:space:]]+bool[[:space:]]+ksu_no_custom_rc\b' drivers/kernelsu/runtime/ksud_integration.c; then
+              echo "::error::ksu_no_custom_rc is referenced but not declared in drivers/kernelsu/runtime/ksud_integration.c"
               exit 1
             fi
           fi
