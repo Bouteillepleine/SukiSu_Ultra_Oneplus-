@@ -1326,20 +1326,9 @@ runs:
             's/^static bool ksu_selinux_hide_running/bool ksu_selinux_hide_running/' \
             "$target" || true
 
-          # --------------------------------------------------------------
-          # 5.10 + LTO compatibility:
-          #
-          # Some older GKI 5.10 trees produce an LTO-time fake_state
-          # undefined-symbol error if fake_state remains static/local while
-          # generated cloned functions reference it.
-          #
-          # Convert fake_state definitions to link-visible definitions.
-          # --------------------------------------------------------------
-
           perl -0pi -e 's/^[ \t]*static[ \t]+(const[ \t]+)?struct[ \t]+selinux_state[ \t]+fake_state([ \t]*[=;])/${1}struct selinux_state fake_state$2/mg' "$target" || true
           perl -0pi -e 's/^[ \t]*static[ \t]+(const[ \t]+)?struct[ \t]+selinux_state[ \t]+\*fake_state([ \t]*[=;])/${1}struct selinux_state *fake_state$2/mg' "$target" || true
 
-          # If a declaration became "const struct..." above, keep it writable.
           sed -i \
             -e 's/^[[:space:]]*const[[:space:]]\+struct[[:space:]]\+selinux_state[[:space:]]\+fake_state/struct selinux_state fake_state/' \
             -e 's/^[[:space:]]*const[[:space:]]\+struct[[:space:]]\+selinux_state[[:space:]]\+\*fake_state/struct selinux_state *fake_state/' \
@@ -1395,11 +1384,6 @@ runs:
         fix_sukisu_linker_symbols() {
           echo "Applying SukiSU linker-symbol compatibility cleanup..."
 
-          # --------------------------------------------------------------
-          # Ensure SukiSU symbol resolver and patch memory backends are built
-          # when their source files exist.
-          # --------------------------------------------------------------
-
           for kbuild in \
             "$KSU_FOLDER/kernel/Kbuild" \
             "$COMMON_KERNEL_FOLDER/drivers/kernelsu/Kbuild"; do
@@ -1419,10 +1403,6 @@ runs:
             fi
           done
 
-          # --------------------------------------------------------------
-          # Remove ksu_init_symbol_resolver() calls from init.c.
-          # --------------------------------------------------------------
-
           for target in \
             "$KSU_FOLDER/kernel/core/init.c" \
             "$COMMON_KERNEL_FOLDER/drivers/kernelsu/core/init.c"; do
@@ -1440,10 +1420,6 @@ runs:
             fi
           done
 
-          # --------------------------------------------------------------
-          # Disable uts_spoof object.
-          # --------------------------------------------------------------
-
           for kbuild in \
             "$KSU_FOLDER/kernel/Makefile" \
             "$KSU_FOLDER/kernel/Kbuild" \
@@ -1459,10 +1435,6 @@ runs:
               echo "✅ Removed uts_spoof.o from $kbuild"
             fi
           done
-
-          # --------------------------------------------------------------
-          # Remove remaining ksu_spoof_version(...) callers from init.c.
-          # --------------------------------------------------------------
 
           for target in \
             "$KSU_FOLDER/kernel/core/init.c" \
@@ -1481,10 +1453,6 @@ runs:
             fi
           done
 
-          # --------------------------------------------------------------
-          # Neutralize ksu_set_spoof_version(...) callers.
-          # --------------------------------------------------------------
-
           for target in \
             "$KSU_FOLDER/kernel/supercall/dispatch.c" \
             "$COMMON_KERNEL_FOLDER/drivers/kernelsu/supercall/dispatch.c"; do
@@ -1502,41 +1470,20 @@ runs:
             fi
           done
 
-          # --------------------------------------------------------------
-          # Neutralize direct ksu_patch_text() calls in selinux_hide.c only.
-          #
-          # Handles:
-          #   ret = ksu_patch_text(...);
-          #   ksu_patch_text(...);
-          #
-          # Also removes stale local variables left behind after direct
-          # runtime patching is disabled.
-          # --------------------------------------------------------------
-
           for target in \
             "$KSU_FOLDER/kernel/feature/selinux_hide.c" \
             "$COMMON_KERNEL_FOLDER/drivers/kernelsu/feature/selinux_hide.c"; do
 
             if [ -f "$target" ]; then
-              # Assignment form:
-              #   ret = ksu_patch_text(...);
               perl -0pi -e 's/\bret[ \t]*=[ \t]*ksu_patch_text[ \t]*\([^;]*\);/ret = 0;/g' "$target"
-
-              # Standalone form:
-              #   ksu_patch_text(...);
               perl -0pi -e 's/^[ \t]*ksu_patch_text[ \t]*\([^;]*\);[ \t]*\n//mg' "$target"
 
-              # Extra fallback for one-line standalone calls.
               sed -i '/^[[:space:]]*ksu_patch_text[[:space:]]*(.*);[[:space:]]*$/d' "$target" || true
 
-              # Remove stale local variables left behind after removing
-              # ksu_patch_text() calls. These are safe to remove because the
-              # patch call that consumed them is gone.
               perl -0pi -e 's/^[ \t]*[A-Za-z_][A-Za-z0-9_]*_fn[ \t]+new_fn[ \t]*=[ \t]*my_[A-Za-z_][A-Za-z0-9_]*[ \t]*;[ \t]*\n//mg' "$target"
               perl -0pi -e 's/^[ \t]*sel_open_handle_status_fn[ \t]+new_fn[ \t]*=[ \t]*my_sel_open_handle_status[ \t]*;[ \t]*\n//mg' "$target"
-              sed -i '/new_fn[[:space:]]*=[[:space:]]*my_sel_open_handle_status/d' "$target" || true
 
-              # Some variants leave new_policy/new_state helpers unused too.
+              sed -i '/new_fn[[:space:]]*=[[:space:]]*my_sel_open_handle_status/d' "$target" || true
               sed -i '/^[[:space:]]*struct[[:space:]]\+selinux_policy[[:space:]]\+\*new_policy[[:space:]]*=/d' "$target" || true
               sed -i '/^[[:space:]]*struct[[:space:]]\+selinux_state[[:space:]]\+\*new_state[[:space:]]*=/d' "$target" || true
 
@@ -1553,13 +1500,6 @@ runs:
               echo "✅ Neutralized ksu_patch_text calls and stale locals in $target"
             fi
           done
-
-          # --------------------------------------------------------------
-          # 5.10 + LTO fake_state compatibility in selinux_hide.c.
-          #
-          # Run this here too, because this function is called after the
-          # KernelSU tree has been copied into common/drivers/kernelsu.
-          # --------------------------------------------------------------
 
           for target in \
             "$KSU_FOLDER/kernel/feature/selinux_hide.c" \
@@ -1578,10 +1518,6 @@ runs:
             fi
           done
 
-          # --------------------------------------------------------------
-          # Disable uts_spoof.c source after removing it from Kbuild.
-          # --------------------------------------------------------------
-
           for target in \
             "$KSU_FOLDER/kernel/feature/uts_spoof.c" \
             "$COMMON_KERNEL_FOLDER/drivers/kernelsu/feature/uts_spoof.c"; do
@@ -1591,10 +1527,6 @@ runs:
               echo "✅ Disabled $target"
             fi
           done
-
-          # --------------------------------------------------------------
-          # Final targeted verification.
-          # --------------------------------------------------------------
 
           for target in \
             "$COMMON_KERNEL_FOLDER/drivers/kernelsu/core/init.c" \
@@ -1956,10 +1888,6 @@ runs:
           fi
         fi
 
-        # ------------------------------------------------------------------
-        # Revert fake patching if it was only used to satisfy context
-        # ------------------------------------------------------------------
-
         if [ "$fake_patched" = 1 ]; then
           if [ "$ANDROID_VER_LOCAL" = "android15" ] && [ "$KERNEL_VER_LOCAL" = "6.6" ]; then
             if grep -qxF $'\tunsigned int nr_subpages = __PAGE_SIZE / PAGE_SIZE;' ./fs/proc/task_mmu.c; then
@@ -1994,6 +1922,37 @@ runs:
         fi
 
         echo "✅ SUSFS patches applied"
+
+        # ------------------------------------------------------------------
+        # Android 16 / 6.12 SELinuxFS compatibility fix
+        # ------------------------------------------------------------------
+
+        if [ "$ANDROID_VER_LOCAL" = "android16" ] && [ "$KERNEL_VER_LOCAL" = "6.12" ]; then
+          SELINUXFS="$COMMON_KERNEL_FOLDER/security/selinux/selinuxfs.c"
+
+          if [ -f "$SELINUXFS" ]; then
+            echo "🩹 Restoring original SELinuxFS file for android16-6.12 SUSFS compatibility..."
+
+            cd "$COMMON_KERNEL_FOLDER"
+            git restore "security/selinux/selinuxfs.c" || git checkout HEAD -- "security/selinux/selinuxfs.c"
+
+            echo "✅ Restored security/selinux/selinuxfs.c"
+
+            echo "🔎 Remaining unresolved-symbol references:"
+            grep -RInE 'ksu_selinux_hide_enabled|fake_status|initialize_fake_status|fake_status_initialize_key|my_sel_open_handle_status' \
+              "security/selinux/selinuxfs.c" || true
+
+            echo "🔎 Checking orphan CONFIG_KSU_SUSFS endif:"
+            grep -nE '#endif.*CONFIG_KSU_SUSFS' \
+              "security/selinux/selinuxfs.c" || true
+
+            echo "🔎 sel_handle_status excerpt:"
+            grep -nE 'sel_open_handle_status|sel_handle_status_ops' \
+              "security/selinux/selinuxfs.c" || true
+          else
+            echo "⚠️ SELinuxFS file not found, skipping restore"
+          fi
+        fi
 
         if [ "$KSU_TYPE" = "SUKISU" ]; then
           fix_sukisu_linker_symbols
@@ -2068,12 +2027,14 @@ runs:
         CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
         CONFIG_KSU_SUSFS_SPOOF_UNAME=n
         CONFIG_KSU_SUSFS_ENABLE_LOG=y
-        CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
         CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
         CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         CONFIG_KSU_SUSFS_SUS_MAP=y
         CONFIG_KSU_SUSFS_SUS_SU=n
         EOF
+
+        sed -i '/^CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=/d' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" || true
+        echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=n" >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
 
         echo "::endgroup::"
     
