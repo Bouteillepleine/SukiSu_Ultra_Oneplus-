@@ -1118,69 +1118,90 @@ runs:
       run: |
         set -euo pipefail
         echo "::group::Add SukiSU Ultra"
-    
+
         cd "$KERNEL_PLATFORM_FOLDER"
-    
-        echo "Adding SukiSU Ultra..."
-    
+
         KSU_INPUT="${{ inputs.ksu_branch_or_hash }}"
-    
+
         if [ -z "$KSU_INPUT" ]; then
           echo "No SukiSU branch/hash provided. Using builtin installer mode."
-    
+
           curl --fail --location --proto '=https' -LSs \
             "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
         else
           echo "Using SukiSU branch/hash: $KSU_INPUT"
-    
+
           curl --fail --location --proto '=https' -LSs \
             "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s "$KSU_INPUT"
         fi
-    
+
         if [ ! -d "$KERNEL_PLATFORM_FOLDER/KernelSU" ]; then
           echo "::error::KernelSU directory was not created by SukiSU setup."
-          echo "Debug folders:"
           find "$KERNEL_PLATFORM_FOLDER" -maxdepth 3 -type d \( -iname "*ksu*" -o -iname "*suki*" \) || true
           exit 1
         fi
-    
+
         cd "$KERNEL_PLATFORM_FOLDER/KernelSU"
-    
+
         KSU_COMMIT_SHA="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
         COMMITS_COUNT="$(git rev-list --count HEAD 2>/dev/null || echo 30000)"
-    
         KSU_VERSION=$((COMMITS_COUNT + 37185))
-    
+
+        TAG_NAME="$(git describe --tags --abbrev=0 2>/dev/null || echo v4.1.3)"
+        KSU_FULL_NAME="${TAG_NAME}-⚡Ultra⚡@SukiSU"
+
         echo "Detected SukiSU commits: $COMMITS_COUNT"
         echo "Calculated SukiSU Ultra version: $KSU_VERSION"
         echo "SukiSU Ultra commit: $KSU_COMMIT_SHA"
-    
+        echo "SukiSU full name: $KSU_FULL_NAME"
+
         if [ -f "$KERNEL_PLATFORM_FOLDER/KernelSU/kernel/Makefile" ]; then
           sed -i "s/DKSU_VERSION=[0-9]*/DKSU_VERSION=${KSU_VERSION}/" "$KERNEL_PLATFORM_FOLDER/KernelSU/kernel/Makefile" || true
           sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" "$KERNEL_PLATFORM_FOLDER/KernelSU/kernel/Makefile" || true
           sed -i "s/DKSU_VERSION=11998/DKSU_VERSION=${KSU_VERSION}/" "$KERNEL_PLATFORM_FOLDER/KernelSU/kernel/Makefile" || true
           sed -i "s/DKSU_VERSION=16/DKSU_VERSION=${KSU_VERSION}/" "$KERNEL_PLATFORM_FOLDER/KernelSU/kernel/Makefile" || true
         fi
-    
-        echo "KSU_COMMIT_SHA=$KSU_COMMIT_SHA" >> "$GITHUB_ENV"
-        echo "KSUVER=$KSU_VERSION" >> "$GITHUB_ENV"
-        echo "NEED_HOOKS=false" >> "$GITHUB_ENV"
-    
-        echo "Add SukiSU Ultra Configuration Settings"
-    
-        cat >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" <<EOF
-        CONFIG_KSU=y
-        CONFIG_KPM=n
-        CONFIG_KSU_MULTI_MANAGER_SUPPORT=y
-        CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-⚡Ultra⚡@SukiSU"
-        EOF
-    
-        echo "SUKISU" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
-        echo "$KSU_VERSION" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
-    
-        echo "SukiSU Ultra Version: $KSU_VERSION"
+
+        # Avoid detached-HEAD naming where possible.
+        # Some SukiSU revisions derive the display name from Git branch metadata.
+        git checkout -B SukiSU "$KSU_COMMIT_SHA" 2>/dev/null || true
+
+        {
+          echo "KSU_COMMIT_SHA=$KSU_COMMIT_SHA"
+          echo "KSUVER=$KSU_VERSION"
+          echo "KSU_FULL_NAME=$KSU_FULL_NAME"
+          echo "NEED_HOOKS=false"
+        } >> "$GITHUB_ENV"
+
+        DEFCONFIG="$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
+
+        mkdir -p "$(dirname "$DEFCONFIG")"
+        touch "$DEFCONFIG"
+
+        sed -i \
+          -e '/^CONFIG_KSU=/d' \
+          -e '/^CONFIG_KPM=/d' \
+          -e '/^CONFIG_KSU_MULTI_MANAGER_SUPPORT=/d' \
+          -e '/^CONFIG_KSU_FULL_NAME_FORMAT=/d' \
+          "$DEFCONFIG" || true
+
+        {
+          printf '%s\n' 'CONFIG_KSU=y'
+          printf '%s\n' 'CONFIG_KPM=n'
+          printf '%s\n' 'CONFIG_KSU_MULTI_MANAGER_SUPPORT=y'
+          printf '%s\n' 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-⚡Ultra⚡@SukiSU"'
+        } >> "$DEFCONFIG"
+
+        echo "SukiSU defconfig entries:"
+        grep -nE 'CONFIG_KSU=|CONFIG_KPM=|CONFIG_KSU_MULTI_MANAGER_SUPPORT=|CONFIG_KSU_FULL_NAME_FORMAT=' "$DEFCONFIG" || true
+
+        {
+          echo "SUKISU"
+          echo "$KSU_VERSION"
+          echo "$KSU_FULL_NAME"
+        } >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
+
         echo "✅ SukiSU Ultra added commit: ${KSU_COMMIT_SHA:0:8}"
-    
         echo "::endgroup::"
 
     - name: Apply SUSFS Patches
