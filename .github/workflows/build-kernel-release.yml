@@ -1,5 +1,10 @@
 name: Build and Release OnePlus Kernels
 
+run-name: >-
+  ${{ github.event.inputs.op_target_model != '' && github.event.inputs.op_target_model || github.event.inputs.op_model }}
+  • SUKISU
+  • ${{ github.event.inputs.build_timestamp != '' && github.event.inputs.build_timestamp || 'auto timestamp' }}
+
 permissions:
   contents: write
   actions: write
@@ -902,7 +907,8 @@ jobs:
       REPO_NAME: ${{ github.event.repository.name }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SUSFS_BASE_VERSION: ${{ needs.set-op-model.outputs.susfs_base_version }}
-      RELEASE_NAME: '*TEST BUILD* OnePlus Kernels With SukiSU Ultra & SUSFS ${{ needs.set-op-model.outputs.susfs_base_version }} *TEST BUILD*'
+      RELEASE_NAME: 'OnePlus Kernels - SukiSU Ultra + SUSFS ${{ needs.set-op-model.outputs.susfs_base_version }}'
+
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v6
@@ -914,19 +920,27 @@ jobs:
         run: |
           set -euo pipefail
 
-          LATEST_MATCHING_TAG=$(gh api repos/$REPO_OWNER/$REPO_NAME/tags \
-            --jq "[.[] | select(.name | startswith(\"${SUSFS_BASE_VERSION}-r\"))] \
-                  | sort_by(.name | split(\"-r\")[1] | tonumber) \
-                  | last | .name // empty")
+          LATEST_MATCHING_TAG="$(
+            {
+              gh api --paginate "repos/$REPO_OWNER/$REPO_NAME/tags?per_page=100" \
+                --jq '.[] | .name' \
+                | grep -E "^${SUSFS_BASE_VERSION}-r[0-9]+$" || true
+            } \
+              | awk -F'-r' 'NF >= 2 {print $0 "\t" $2}' \
+              | sort -k2,2n \
+              | tail -n1 \
+              | cut -f1
+          )"
 
           if [ -z "$LATEST_MATCHING_TAG" ]; then
             NEW_TAG="${SUSFS_BASE_VERSION}-r1"
           else
-            NEW_TAG=$(echo "$LATEST_MATCHING_TAG" | awk -F'-r' '{printf "%s-r%d", $1, $2+1}')
+            NEW_TAG="$(echo "$LATEST_MATCHING_TAG" | awk -F'-r' '{printf "%s-r%d", $1, $2+1}')"
           fi
 
           echo "New tag: $NEW_TAG"
           echo "NEW_TAG=${NEW_TAG}" >> "$GITHUB_ENV"
+
           git tag "$NEW_TAG"
           git push origin "$NEW_TAG"
 
@@ -936,6 +950,109 @@ jobs:
           path: ./downloaded-artifacts
           merge-multiple: true
           skip-decompress: true
+
+      - name: 🔐 Generate Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! compgen -G "./downloaded-artifacts/*.zip" > /dev/null; then
+            echo "::error::No ZIP artifacts found."
+            find ./downloaded-artifacts -maxdepth 2 -type f -print || true
+            exit 1
+          fi
+
+          cd downloaded-artifacts
+          sha256sum *.zip | sort -k2 > ../00_CHECKSUMS.txt
+          cd ..
+
+          echo "Generated 00_CHECKSUMS.txt:"
+          cat 00_CHECKSUMS.txt
+
+      - name: 📥 Generate Downloads Index
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "# 📥 OnePlus Kernel Downloads"
+            echo ""
+            echo "> Select the ZIP matching your exact **device**, **OOS version**, and **kernel base**."
+            echo ""
+            echo "## ⚠️ Important"
+            echo ""
+            echo "- Flashing the wrong ZIP may cause bootloop."
+            echo "- Back up your current boot/init_boot/vendor_boot before flashing."
+            echo "- Use Kernel Flasher or another trusted flashing method."
+            echo "- If switching from Magisk, APatch, KernelSU, SukiSU Ultra, or another fork, clean old root leftovers carefully."
+            echo ""
+            echo "## Quick Guide"
+            echo ""
+            echo "| What to check | Example |"
+            echo "|---|---|"
+            echo "| **Device** | \`OP12\`, \`OP13r\`, \`OP-NORD-4\` |"
+            echo "| **OOS Version** | \`OOS16\`, \`OOS15\`, \`OOS14\` |"
+            echo "| **Kernel Base** | \`android15-6.6.30\`, \`android14-6.1.75\` |"
+            echo "| **Root Type** | \`SUKISU\` |"
+            echo ""
+          } > 00_DOWNLOADS.md
+
+          for os in OOS16 OOS15 OOS14; do
+            mapfile -t files < <(find downloaded-artifacts -maxdepth 1 -type f -name "*_${os}_*.zip" | sort)
+
+            if [ "${#files[@]}" -eq 0 ]; then
+              continue
+            fi
+
+            {
+              echo "## ${os}"
+              echo ""
+              echo "| Device | Kernel | Root | SUSFS | Download | SHA256 |"
+              echo "|---|---|---|---|---|---|"
+            } >> 00_DOWNLOADS.md
+
+            for file in "${files[@]}"; do
+              name="$(basename "$file")"
+              zipname="${name%.zip}"
+              rest="${zipname#AK3_}"
+
+              IFS='_' read -ra parts <<< "$rest"
+
+              model="${parts[0]:-unknown}"
+              os_version="${parts[1]:-unknown}"
+              kernel_version="${parts[2]:-unknown}"
+              ksu_type="${parts[3]:-unknown}"
+              ksu_ver="${parts[4]:-unknown}"
+
+              susfs_ver="none"
+              if [ "${parts[5]:-}" = "SuSFS" ]; then
+                susfs_ver="${parts[6]:-unknown}"
+              fi
+
+              sha="$(sha256sum "$file" | awk '{print $1}')"
+              short_sha="${sha:0:12}"
+              asset_url="${{ github.server_url }}/${{ github.repository }}/releases/download/${{ env.NEW_TAG }}/${name}"
+
+              echo "| \`${model}\` | \`${kernel_version}\` | \`${ksu_type}-${ksu_ver}\` | \`${susfs_ver}\` | [Download](${asset_url}) | \`${short_sha}...\` |" >> 00_DOWNLOADS.md
+            done
+
+            echo "" >> 00_DOWNLOADS.md
+          done
+
+          {
+            echo "---"
+            echo ""
+            echo "## 🔐 Full SHA256 Checksums"
+            echo ""
+            echo "Use \`00_CHECKSUMS.txt\` from this release to verify downloads."
+            echo ""
+            echo '```bash'
+            echo "sha256sum -c 00_CHECKSUMS.txt"
+            echo '```'
+          } >> 00_DOWNLOADS.md
+
+          echo "Generated 00_DOWNLOADS.md:"
+          cat 00_DOWNLOADS.md
 
       - name: 📝 Generate Device List and Final Release Notes
         id: generate-notes
@@ -947,28 +1064,38 @@ jobs:
 
           declare -A device_info
 
-          JSON_BUILD_DATA=$(jq -c '.' ./downloaded-artifacts/matrix.json)
+          JSON_BUILD_DATA="$(jq -c '.' ./downloaded-artifacts/matrix.json)"
 
           for file in $(find downloaded-artifacts -maxdepth 1 -name "*.zip" -type f | sort); do
-            zipname=$(basename "$file" .zip)
-            rest="${zipname#AK3_}"
-            IFS='_' read -ra parts <<< "$rest"
+            if [ -f "$file" ]; then
+              zipname="$(basename "$file" .zip)"
+              rest="${zipname#AK3_}"
 
-            model="${parts[0]}"
-            os_version="${parts[1]}"
-            kernel_version="${parts[2]}"
-            ksu_type="${parts[3]}"
-            ksu_ver="${parts[4]}"
+              IFS='_' read -ra parts <<< "$rest"
 
-            if [ "${parts[5]:-}" = "SuSFS" ]; then
-              susfs_ver="${parts[6]:-unknown}"
-            else
-              susfs_ver="none"
+              model="${parts[0]:-unknown}"
+              os_version="${parts[1]:-unknown}"
+              kernel_version="${parts[2]:-unknown}"
+              ksu_type_asset="${parts[3]:-unknown}"
+              ksu_ver="${parts[4]:-unknown}"
+
+              if [ "${parts[5]:-}" = "SuSFS" ]; then
+                susfs_ver="${parts[6]:-unknown}"
+              else
+                susfs_ver="none"
+              fi
+
+              file_name="$(basename "$file")"
+              full_model="${model}_${os_version}_${kernel_version}"
+
+              device_info["$full_model"]="$model|$os_version|$kernel_version|$ksu_type_asset|$ksu_ver|$susfs_ver|$file_name"
             fi
-
-            full_model="${model}_${os_version}_${kernel_version}"
-            device_info["$full_model"]="$model|$os_version|$kernel_version|$ksu_type|$ksu_ver|$susfs_ver"
           done
+
+          if [ "${#device_info[@]}" -eq 0 ]; then
+            echo "::error::No device ZIPs found!"
+            exit 1
+          fi
 
           ksu_type="${{ fromJSON(needs.set-op-model.outputs.ksu_options_normalized)[0].type }}"
           ksu_ref="${{ fromJSON(needs.set-op-model.outputs.ksu_options_normalized)[0].hash }}"
@@ -976,6 +1103,7 @@ jobs:
 
           OPTIMIZE_LEVEL="${{ inputs.optimize_level }}"
           CLEAN_BUILD="${{ inputs.clean_build }}"
+          BUILD_TIMESTAMP_INPUT="${{ inputs.build_timestamp }}"
 
           declare -A susfs_map=(
             ["android12-5.10"]="${{ needs.set-op-model.outputs.susfs_hash_android12_5_10 }}"
@@ -987,68 +1115,8 @@ jobs:
 
           IFS=',' read -ra active_gki_keys <<< "${{ needs.set-op-model.outputs.active_gki_keys }}"
 
-          cat << EOF > release_notes.md
-          # 🎯 OnePlus Kernels with SukiSU Ultra & SUSFS $SUSFS_BASE_VERSION
-
-          > **Build Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')  
-          > **Build ID:** \`${{ github.run_id }}\`  
-          > **Workflow:** [\`${{ github.workflow }}\`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-
-          ---
-
-          ## 📦 Built Devices (${#device_info[@]} total)
-
-          | Model | OS Version | Kernel Version | Features |
-          |-------|------------|----------------|----------|
-          EOF
-
-          for full_key in $(printf '%s\n' "${!device_info[@]}" | sort); do
-            IFS='|' read -r model os_ver kernel_ver _ _ _ <<< "${device_info[$full_key]}"
-
-            full_kv=$(echo "$kernel_ver" | sed 's/^[^-]*-//')
-            possible_orig_model="${model}-${full_kv}"
-
-            feature_flags=$(jq -r --arg MODEL "$model" --arg ORIG_MODEL "$possible_orig_model" --arg OS "$os_ver" '
-              ([ .[] | select(.model == $ORIG_MODEL and .os_version == $OS) ][0]) //
-              ([ .[] | select(.model == $MODEL and .os_version == $OS) ][0]) |
-              "\(.hmbird // false)\t\(.susfs // false)\t\(.bbr // false)\t\(.bbg // false)\t\(.ttl // false)\t\(.ip_set // false)\t\(.unicode // false)\t\(.ds // false)\t\(.ntsync // false)"
-            ' <<< "$JSON_BUILD_DATA")
-
-            features=()
-
-            if [[ -z "$feature_flags" ]]; then
-              features_str="N/A"
-            else
-              IFS=$'\t' read -r hmbird susfs bbr bbg ttl ip_set unicode ds ntsync <<< "$feature_flags"
-
-              [[ "$hmbird" == "true" ]] && features+=("🐦 HMBIRD")
-              [[ "$susfs" == "true" ]] && features+=("ඞ SusFS")
-              [[ "$bbr" == "true" ]] && features+=("🚀 BBR")
-              [[ "$bbg" == "true" ]] && features+=("🛡️ BBG")
-              [[ "$ttl" == "true" ]] && features+=("🌐 TTL")
-              [[ "$ip_set" == "true" ]] && features+=("🧱 IP_SET & IPv6 NAT")
-              [[ "$unicode" == "true" ]] && features+=("🔧 Unicode Fix")
-              [[ "$ds" == "true" ]] && features+=("💻 Droidspaces")
-              [[ "$ntsync" == "true" ]] && features+=("🔃 NTSync")
-
-              if [ "${#features[@]}" -eq 0 ]; then
-                features_str="N/A"
-              else
-                features_str="$(IFS='   '; echo "${features[*]}")"
-              fi
-            fi
-
-            printf "| %s | %s | %s | %s |\n" \
-              "$model" "$os_ver" "$kernel_ver" "$features_str" >> release_notes.md
-          done
-
-          if [ ${#device_info[@]} -gt 0 ]; then
-            first_entry=$(printf '%s\n' "${!device_info[@]}" | sort | head -n1)
-            IFS='|' read -r _ _ _ _ ksu_ver_global _ <<< "${device_info[$first_entry]}"
-          else
-            echo "::error::No device info found!" >&2
-            exit 1
-          fi
+          first_entry="$(printf '%s\n' "${!device_info[@]}" | sort | head -n1)"
+          IFS='|' read -r _ _ _ _ ksu_ver_global _ _ <<< "${device_info[$first_entry]}"
 
           ksu_display_value() {
             local input="$1"
@@ -1061,7 +1129,51 @@ jobs:
             fi
           }
 
-          ksu_display=$(ksu_display_value "$ksu_ref" "$ksu_resolved_hash")
+          ksu_display="$(ksu_display_value "$ksu_ref" "$ksu_resolved_hash")"
+
+          cat << EOF > release_notes.md
+          # 🎯 OnePlus Kernels with SukiSU Ultra & SUSFS ${SUSFS_BASE_VERSION}
+
+          This release contains flashable AnyKernel3 ZIPs for supported OnePlus devices.
+
+          > ⚠️ **Important:** Match your exact **device model**, **OOS version**, and **kernel base** before flashing.
+
+          ---
+
+          ## 📥 Downloads
+
+          For the full grouped download table with SHA256 hashes, open:
+
+          **➡️ \`00_DOWNLOADS.md\`**
+
+          Quick asset helpers included in this release:
+
+          - **\`00_DOWNLOADS.md\`** - grouped downloads by OOS version
+          - **\`00_CHECKSUMS.txt\`** - full SHA256 checksums
+
+          ---
+
+          ## ✅ Read Before Downloading
+
+          - Download only the ZIP matching your **device**, **OOS version**, and **kernel base**.
+          - Flashing the wrong kernel may cause bootloop.
+          - Back up your current boot/init_boot/vendor_boot partitions.
+          - If switching from Magisk, APatch, KernelSU, SukiSU Ultra, or another fork, clean old root leftovers carefully.
+
+          ---
+
+          ## 📦 Built Devices (${#device_info[@]} total)
+
+          | Model | OS | Kernel | Root | SUSFS | File |
+          |---|---|---|---|---|---|
+          EOF
+
+          for full_key in $(printf '%s\n' "${!device_info[@]}" | sort); do
+            IFS='|' read -r model os_ver kernel_ver ksu_type_asset ksu_ver susfs_ver file_name <<< "${device_info[$full_key]}"
+            asset_url="${{ github.server_url }}/${{ github.repository }}/releases/download/${{ env.NEW_TAG }}/${file_name}"
+
+            echo "| \`${model}\` | \`${os_ver}\` | \`${kernel_ver}\` | \`${ksu_type_asset}-${ksu_ver}\` | \`${susfs_ver}\` | [Download](${asset_url}) |" >> release_notes.md
+          done
 
           cat << EOF >> release_notes.md
 
@@ -1070,98 +1182,153 @@ jobs:
           ## 🔧 Build Configuration
 
           | Component | Version/Setting |
-          |-----------|----------------|
-          | **SukiSU Ultra Branch** | \`$ksu_display\` |
-          | **SukiSU Ultra Version** | \`$ksu_ver_global\` |
-          | **SUSFS Version** | \`$SUSFS_BASE_VERSION\` |
-          | **Optimization Level** | \`$OPTIMIZE_LEVEL\` |
+          |---|---|
+          | **Root Solution** | \`SukiSU Ultra\` |
+          | **SukiSU Ultra Ref** | \`${ksu_display}\` |
+          | **SukiSU Ultra Version** | \`${ksu_ver_global}\` |
+          | **SUSFS Version** | \`${SUSFS_BASE_VERSION}\` |
+          | **Optimization Level** | \`${OPTIMIZE_LEVEL}\` |
           | **Clean Build** | $( [ "$CLEAN_BUILD" = "true" ] && echo "✅ Yes (no ccache)" || echo "❌ No (ccache enabled)" ) |
+          | **Build Timestamp Input** | \`${BUILD_TIMESTAMP_INPUT:-auto}\` |
           | **Compiler** | Clang (version varies by device) |
+          | **Workflow Run** | [\`${{ github.run_id }}\`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
 
           ### 📌 SUSFS Branch Mapping
 
           | Kernel Version | SUSFS Commit |
-          |----------------|--------------|
-          $(for key in "${active_gki_keys[@]}"; do
+          |---|---|
+          EOF
+
+          for key in "${active_gki_keys[@]}"; do
             [ -z "$key" ] && continue
-            echo "| $key | \`${susfs_map[$key]:-unknown}\` |"
-          done)
+            echo "| \`${key}\` | \`${susfs_map[$key]:-unknown}\` |" >> release_notes.md
+          done
+
+          cat << EOF >> release_notes.md
 
           ---
 
-          ## ✨ Features & Capabilities
+          ## ✨ Included Features
 
           ### 🔐 Root Management
-          - **SukiSU Ultra** - Kernel-level root solution based on the KernelSU ecosystem
-          - **SUSFS $SUSFS_BASE_VERSION** - Advanced hiding and security features
+
+          - **SukiSU Ultra** - kernel-level root solution based on the KernelSU ecosystem.
+          - **SUSFS ${SUSFS_BASE_VERSION}** - advanced hiding and spoofing features.
+          - **SUSFS Module required** for SUSFS userspace features.
 
           ### 🛡️ Security & Privacy
-          - **Baseband Guard (BBG)** - LSM-based baseband security
-          - **SUSFS Hide Features**
-          - **Ptrace Leak Fix** - For kernels < 5.16
-          - **Unicode Fix** - Experimental Unicode bypass fix
+
+          - SUS_PATH
+          - SUS_MOUNT
+          - SUS_KSTAT
+          - SPOOF_UNAME
+          - SPOOF_CMDLINE / BOOTCONFIG
+          - OPEN_REDIRECT
+          - SUS_MAP
+          - AVC spoofing where supported
+          - Ptrace leak fix for kernels below 5.16
+          - Unicode path bypass fix where enabled
 
           ### 🚀 Performance & Networking
-          - **BBRv1**
-          - **Wireguard**
-          - **IP Set & IPv6 NAT Support**
-          - **TTL Target Support**
-          - **LTO**
-          - **ccache-accelerated builds**
 
-          ### 🔧 System Features
-          - **TMPFS_XATTR**
-          - **TMPFS_POSIX_ACL**
-          - **HMBIRD SCX**
-          - **Droidspaces**
-          - **NTSync**
+          - BBR TCP congestion control where enabled
+          - WireGuard support where enabled
+          - IP_SET and IPv6 NAT where enabled
+          - TTL target support where enabled
+          - LTO build optimization
+          - ccache-accelerated builds
+          - General kernel optimization patches
+
+          ### 🔧 Optional Device Features
+
+          - HMBIRD SCX where enabled
+          - Droidspaces where enabled
+          - NTSync where enabled
+          - TMPFS_XATTR and TMPFS_POSIX_ACL
 
           ---
 
-          ## 📱 Manager Applications
+          ## 📱 Recommended Apps
 
-          ### Official Manager
+          ### Root Manager
+
           - **SukiSU Ultra Manager**  
-            → [GitHub Release](https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases)
+            → https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases
 
-          ### Required Module
+          ### Required SUSFS Module
+
           - **SUSFS Module**  
-            → [GitHub Release](https://github.com/sidex15/ksu_module_susfs/releases)
+            → https://github.com/sidex15/ksu_module_susfs/releases
 
           ### Recommended Flasher
+
           - **Kernel Flasher**  
-            → [GitHub Release](https://github.com/fatalcoder524/KernelFlasher/releases)
+            → https://github.com/fatalcoder524/KernelFlasher/releases
 
           ---
 
-          ## 📥 Installation Instructions
+          ## 📥 Installation
 
-          1. Download the correct AnyKernel3 ZIP for your device.
-          2. Backup your current boot image.
-          3. Flash the ZIP with Kernel Flasher.
-          4. Install the matching SukiSU Ultra Manager APK.
-          5. Reboot.
+          1. Download the correct ZIP from **\`00_DOWNLOADS.md\`**.
+          2. Back up your current boot/init_boot/vendor_boot.
+          3. Flash the ZIP using Kernel Flasher.
+          4. Install the matching SukiSU Ultra Manager.
+          5. Install the SUSFS module if you need SUSFS features.
+          6. Reboot.
+
+          ---
+
+          ## 🔐 Verify Downloads
+
+          Download **\`00_CHECKSUMS.txt\`** and run:
+
+          \`\`\`bash
+          sha256sum -c 00_CHECKSUMS.txt
+          \`\`\`
+
+          ---
+
+          ## 📜 Changelog
+
+          - Updated SUSFS to ${SUSFS_BASE_VERSION}.
+          - Added SukiSU Ultra support.
+          - Improved release download organization.
+          - Added grouped download index.
+          - Added SHA256 checksum file.
+          - Added direct download links in release notes.
+          - Added single-device build targeting with \`op_target_model\`.
+          - Added workflow run-name timestamp display.
+          - Improved ccache build system.
+          - Added IP_SET, IPv6 NAT, TTL, TMPFS_XATTR, TMPFS_POSIX_ACL where enabled.
+          - Added Ptrace leak fix for kernels below 5.16.
+          - Added Unicode bypass fix where enabled.
+          - Added Droidspaces support where enabled.
+          - Added NTSync support where enabled.
+          - Compiler optimization: ${OPTIMIZE_LEVEL}.
 
           ---
 
           ## 🙏 Credits
 
-          - **SukiSU Ultra Team** - Root solution
+          - **SukiSU Ultra Team** - root solution
           - **KernelSU ecosystem contributors**
           - **simonpunk** - SUSFS development
-          - **OnePlus** - Kernel source code
-          - **Community Contributors**
+          - **OnePlus** - kernel source code
+          - **Community contributors and testers**
 
           ---
 
           **⚡ Built with ❤️ by the community**
           EOF
 
+          echo "--- Final Release Notes ---"
           cat release_notes.md
 
       - name: 🚀 Create GitHub Release
         shell: bash
         run: |
+          set -euo pipefail
+
           gh release create "${{ env.NEW_TAG }}" \
             --repo "${{ env.REPO_OWNER }}/${{ env.REPO_NAME }}" \
             --title "${{ env.RELEASE_NAME }}" \
@@ -1171,10 +1338,17 @@ jobs:
       - name: 📤 Upload Release Assets Dynamically
         shell: bash
         run: |
+          set -euo pipefail
+
+          echo "Uploading helper files..."
+          gh release upload "${{ env.NEW_TAG }}" 00_DOWNLOADS.md --clobber --repo "${{ env.REPO_OWNER }}/${{ env.REPO_NAME }}"
+          gh release upload "${{ env.NEW_TAG }}" 00_CHECKSUMS.txt --clobber --repo "${{ env.REPO_OWNER }}/${{ env.REPO_NAME }}"
+
+          echo "Uploading kernel ZIPs..."
           for file in ./downloaded-artifacts/*.zip; do
             if [ -f "$file" ]; then
               echo "Uploading $file..."
-              gh release upload "${{ env.NEW_TAG }}" "$file" --clobber
+              gh release upload "${{ env.NEW_TAG }}" "$file" --clobber --repo "${{ env.REPO_OWNER }}/${{ env.REPO_NAME }}"
             fi
           done
 
@@ -1182,6 +1356,10 @@ jobs:
         if: success()
         shell: bash
         run: |
+          set -euo pipefail
+
+          kernel_count="$(find ./downloaded-artifacts -maxdepth 1 -name "*.zip" -type f | wc -l)"
+
           cat >> "$GITHUB_STEP_SUMMARY" << EOF
 
           ---
@@ -1189,16 +1367,25 @@ jobs:
           ## 🎉 Release Created Successfully
 
           **Tag:** [\`${{ env.NEW_TAG }}\`](${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ env.NEW_TAG }})  
-          **Kernels:** $(find ./downloaded-artifacts -maxdepth 1 -name "*.zip" -type f | wc -l)
+          **Release:** ${{ env.RELEASE_NAME }}  
+          **Kernels:** ${kernel_count}
+
+          ### 📘 User Download Helpers
+
+          - \`00_DOWNLOADS.md\` - grouped downloads by OOS version
+          - \`00_CHECKSUMS.txt\` - SHA256 checksums
 
           ### 📦 Assets
           EOF
 
+          echo "- \`00_DOWNLOADS.md\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`00_CHECKSUMS.txt\`" >> "$GITHUB_STEP_SUMMARY"
+
           for zip in ./downloaded-artifacts/*.zip; do
             if [ -f "$zip" ]; then
-              name=$(basename "$zip")
-              size=$(stat -c%s "$zip")
-              size_mb=$(echo "scale=2; $size / 1024 / 1024" | bc)
+              name="$(basename "$zip")"
+              size="$(stat -c%s "$zip")"
+              size_mb="$(echo "scale=2; $size / 1024 / 1024" | bc)"
               echo "- \`$name\` (${size_mb} MB)" >> "$GITHUB_STEP_SUMMARY"
             fi
           done
