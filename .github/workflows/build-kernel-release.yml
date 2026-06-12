@@ -915,7 +915,7 @@ jobs:
           | Metric | Value |
           |--------|-------|
           | **Kernel** | ${{ steps.build.outputs.kernel_version }} |
-          | **ReSukiSU** | v${{ steps.build.outputs.ksu_version }} |
+          | **SukiSU Ultra** | v${{ steps.build.outputs.ksu_version }} |
           | **Build Timestamp** | \`${{ steps.build.outputs.build_timestamp }}\` |
           EOF
 
