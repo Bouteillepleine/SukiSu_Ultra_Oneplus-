@@ -19,7 +19,7 @@
   "ds": false,
   "bbg": false,
   "bbr": true,
-  "bbr3": true,
+  "bbr3": false,
   "ttl": true,
   "ip_set": true,
   "unicode": true,
