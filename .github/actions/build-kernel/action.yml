@@ -1496,14 +1496,23 @@ runs:
         cd "$COMMON_KERNEL_FOLDER"
 
         # Define modules that MUST NEVER be blacklisted
-        RISKY_MODULES=("coresight" "rust_binder" "msm_kgsl" "camera")
-        
+        RISKY_MODULES=("coresight" "rust_binder" "msm_kgsl" "camera" "oplusboot" "rmnet_wlan" "rmnet_core" "msm_drm" "cnss2" "oplus_chg_v2" "reboot_mode" "rfkill" "bootloader_log")
+
         declare -a modules=()
         IFS=',' read -ra ADDR <<< "$OP_BLACKLIST_MODULES"
         for mod in "${ADDR[@]}"; do
           [[ -n "$mod" ]] && modules+=("$mod")
         done
-        
+
+        if [ "$OP_BBR" = "true" ] || [ "$OP_BBR3" = "true" ]; then
+          if [[ ! " ${modules[*]} " =~ " oplus_network_tuning " ]]; then
+            modules+=("oplus_network_tuning")
+          fi
+          if [[ ! " ${modules[*]} " =~ " oplus_networks_tuning " ]]; then
+            modules+=("oplus_networks_tuning")
+          fi
+        fi
+
         # Safety Validation Loop (Filter out risky modules)
         declare -a validated_modules=()
         for mod in "${modules[@]}"; do
