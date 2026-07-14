@@ -1072,6 +1072,68 @@ fi
   done
 fi
 
+# ---------------------------------------------------------------------------
+# SukiSU commit skew (Kconfig/Kbuild).
+#
+# The susfs4ksu enable-patch (10_enable_susfs_for_ksu.patch) is regenerated
+# against a newer SukiSU tree that already carries CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER.
+# Its Kconfig/Kbuild hunks use that config's stanza as their anchor, so they
+# REJECT on SukiSU commits that predate it (e.g. the current pinned KSU driver):
+#   - kernel/Kbuild.rej  : hunk only DELETES the X86-dispatcher ccflags block,
+#                          which is absent here -> nothing to apply, drop it.
+#   - kernel/Kconfig.rej : hunk ADDS the whole 'menu "KernelSU - SUSFS"' block.
+#                          If we don't re-inject it, none of the CONFIG_KSU_SUSFS*
+#                          symbols exist and SUSFS is SILENTLY COMPILED OUT.
+# Recover both idempotently (same philosophy as the mm/memory.c reject below).
+# ---------------------------------------------------------------------------
+if [ -f kernel/Kconfig.rej ]; then
+  if ! grep -q 'menu "KernelSU - SUSFS"' kernel/Kconfig; then
+    echo "Re-injecting SUSFS Kconfig menu (enable-patch hunk rejected on this SukiSU commit)"
+    # Reconstruct the added block from the reject: keep '+' (added) and ' ' (context)
+    # lines between '+menu "KernelSU - SUSFS"' and the closing '+endmenu', drop '-' lines.
+    awk '
+      /^\+menu "KernelSU - SUSFS"/ { f = 1 }
+      f {
+        if (/^-/) next
+        line = $0
+        sub(/^[+ ]/, "", line)
+        print line
+        if ($0 ~ /^\+endmenu/) exit
+      }
+    ' kernel/Kconfig.rej > kernel/.susfs_menu.kconfig
+
+    if ! grep -q 'config KSU_SUSFS' kernel/.susfs_menu.kconfig; then
+      echo "::error::Could not extract SUSFS menu block from kernel/Kconfig.rej"
+      cat kernel/Kconfig.rej
+      exit 1
+    fi
+
+    # Splice the block in immediately before the KernelSU menu's closing endmenu.
+    awk '
+      FNR == NR { blk = blk $0 ORS; next }
+      /^endmenu[[:space:]]*$/ && !done { printf "%s", blk; done = 1 }
+      { print }
+    ' kernel/.susfs_menu.kconfig kernel/Kconfig > kernel/Kconfig.tmp
+    mv kernel/Kconfig.tmp kernel/Kconfig
+    rm -f kernel/.susfs_menu.kconfig
+
+    if ! grep -q 'config KSU_SUSFS' kernel/Kconfig; then
+      echo "::error::Failed to inject SUSFS menu into kernel/Kconfig"
+      exit 1
+    fi
+  fi
+  rm -f kernel/Kconfig.rej
+fi
+
+if [ -f kernel/Kbuild.rej ]; then
+  # Only rejected hunk deletes the CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER ccflags
+  # block; apply that deletion if the block happens to be present, else it's a no-op.
+  if grep -q 'CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER' kernel/Kbuild; then
+    sed -i '/ifeq (\$(CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER),y)/,/^endif/d' kernel/Kbuild
+  fi
+  rm -f kernel/Kbuild.rej
+fi
+
 if [ -n "$(find . -name '*.rej' -print -quit)" ]; then
   echo "::error::Unexpected KernelSU-side .rej files remain:"
   find . -name '*.rej' -exec echo "=== {} ===" \; -exec cat {} \;
