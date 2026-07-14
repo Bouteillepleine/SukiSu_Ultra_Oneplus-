@@ -75,6 +75,28 @@ sed -i "1i$include" "$file"
 # SukiSU compatibility helpers
 # =============================================================================
 
+# SukiSU's ksu_late_loaded (LKM "late load" mode) has no meaning for these built-in,
+# kprobe-hooked SUSFS builds. The susfs enable-patch strips it tree-wide (it removes
+# the definition, the extern, the assignments and every branch), but those hunks reject
+# against current SukiSU, so we replicate the removal by hand. Delete the definition and
+# assignments (a bare `0 = ...;` would not compile), then force every remaining read to
+# the built-in-always value: !ksu_late_loaded -> 1, ksu_late_loaded -> 0. Idempotent, so
+# it is a no-op wherever the patch hunks happened to apply.
+neutralize_ksu_late_loaded() {
+  local target="$1"
+  [ -f "$target" ] || return 0
+
+  sed -i \
+-e '/^[[:space:]]*bool[[:space:]]\+ksu_late_loaded[[:space:]]*;/d' \
+-e '/^[[:space:]]*ksu_late_loaded[[:space:]]*=/d' \
+"$target" || true
+
+  sed -i \
+-e 's/![[:space:]]*ksu_late_loaded/1/g' \
+-e 's/\bksu_late_loaded\b/0/g' \
+"$target" || true
+}
+
 fix_sukisu_init_c() {
   local target="$1"
   [ -f "$target" ] || return 0
@@ -88,13 +110,16 @@ fix_sukisu_init_c() {
 -e 's/\bksu_syscall_hook_manager_exit[[:space:]]*(/ksu_syscall_hook_exit(/g' \
 "$target" || true
 
-  sed -i \
--e 's/if[[:space:]]*(ksu_late_loaded)[[:space:]]*{/if (0) {/' \
--e 's/if[[:space:]]*(!ksu_late_loaded)/if (1)/' \
-"$target" || true
+  neutralize_ksu_late_loaded "$target"
 
   local root_dir
   root_dir="$(dirname "$(dirname "$target")")"
+
+  # The definition is gone, so drop the now-dangling extern in the tree's ksu.h too
+  # (covers the KSU tree kernel/include/ksu.h and the mirror drivers/kernelsu/include/ksu.h).
+  if [ -f "$root_dir/include/ksu.h" ]; then
+sed -i '/extern[[:space:]]\+bool[[:space:]]\+ksu_late_loaded[[:space:]]*;/d' "$root_dir/include/ksu.h" || true
+  fi
 
   if ! grep -Rqs '^[[:space:]]*\(void\|int\)[[:space:]]\+ksu_syscall_hook_init[[:space:]]*(' "$root_dir" --include='*.c' 2>/dev/null; then
 sed -i '/ksu_syscall_hook_init[[:space:]]*();/d' "$target" || true
@@ -235,6 +260,8 @@ fix_sukisu_ksud_integration_c() {
   [ -f "$target" ] || return 0
 
   echo "Fixing SukiSU ksud_integration compatibility in: $target"
+
+  neutralize_ksu_late_loaded "$target"
 
   if ! grep -q 'ksu_no_custom_rc' "$target"; then
 echo "ℹ️ ksu_no_custom_rc not referenced in $target"
@@ -403,6 +430,8 @@ fix_sukisu_dispatch_c() {
   [ -f "$target" ] || return 0
 
   echo "Fixing SukiSU dispatch SUSFS compatibility in: $target"
+
+  neutralize_ksu_late_loaded "$target"
 
   if ! grep -q '#include <linux/namei.h>' "$target"; then
 if grep -q '#include <linux/thread_info.h>' "$target"; then
