@@ -12,7 +12,7 @@ permissions:
 concurrency:
   # A new TEST dispatch cancels the previous test build (only the latest matters).
   # RELEASE builds get their own group and are NEVER auto-cancelled mid-run.
-  group: ${{ github.workflow }}-${{ github.event.inputs.make_release == 'true' && 'release' || 'test' }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.inputs.make_release == 'true' && 'release' || 'test' }}-${{ github.ref }}-${{ github.event.inputs.op_target_model != '' && github.event.inputs.op_target_model || github.event.inputs.op_model }}
   cancel-in-progress: ${{ github.event.inputs.make_release != 'true' }}
 
 on:
