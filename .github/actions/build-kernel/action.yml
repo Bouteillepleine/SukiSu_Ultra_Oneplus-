@@ -1111,6 +1111,30 @@ runs:
         echo "✅ KSU hooks applied"
         echo "::endgroup::"
 
+    - name: Apply SELinux Oracle Patches
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Apply SELinux oracle (_hook) patches"
+        HOOK="$BOUTEILLE_KERNEL_PATCHES_FOLDER/common/_hook"
+        KV="${KERNEL_VER}"
+        dos2unix "$HOOK"/*.patch 2>/dev/null || true
+        cd "$COMMON_KERNEL_FOLDER"
+        patch -p1 --forward < "$HOOK/hide_selinux_selinuxfs.patch" || echo "::warning::selinuxfs oracle patch did not apply"
+        if [ "$KV" = "6.12" ]; then
+          patch -p1 --forward < "$HOOK/hide_selinux_attr_6_12.patch" || echo "::warning::attr(6.12) oracle patch did not apply"
+        else
+          patch -p1 --forward < "$HOOK/hide_selinux_attr.patch" || echo "::warning::attr oracle patch did not apply"
+        fi
+        case "$KV" in
+          6.6|6.12) patch -p1 --forward < "$HOOK/quiet_selinux_audit.patch" || echo "::warning::audit oracle patch did not apply" ;;
+          *)        patch -p1 --forward < "$HOOK/quiet_selinux_audit_legacy.patch" || echo "::warning::audit(legacy) oracle patch did not apply" ;;
+        esac
+        cd "$KSU_FOLDER"
+        patch -p1 --forward < "$HOOK/fix_selinux_seqno.patch" || echo "::warning::seqno patch did not apply"
+        echo "SELinux oracle patches applied"
+        echo "::endgroup::"
+
     - name: Apply Other Patches
       shell: bash
       run: |
