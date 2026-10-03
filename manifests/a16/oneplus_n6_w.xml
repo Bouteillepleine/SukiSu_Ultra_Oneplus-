@@ -4,7 +4,7 @@
   <default remote="clo-la" revision="dummy_revision" sync-c="true" sync-tags="false"/>
   <remote fetch="https://github.com/OnePlusOSS" name="origin"/>
   <remote fetch="https://github.com/Bouteillepleine" name="Bouteillepleine"/>
-  <project remote="Bouteillepleine" name="AnyKernel3" path="AnyKernel3" revision="suite"/>
+  <project remote="Bouteillepleine" name="AnyKernel3" path="AnyKernel3" revision="gki-2.0"/>
   <project remote="origin" name="android_kernel_oneplus_mt6835" path="kernel-5.15" revision="oneplus/mt6835_b_16.0_n6">
     <linkfile dest="kernel_platform/common" src="."/>
   </project>

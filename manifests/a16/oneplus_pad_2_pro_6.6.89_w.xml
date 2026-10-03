@@ -3,7 +3,7 @@
   <remote fetch="https://git.codelinaro.org/clo/la" name="clo-la"/>
   <remote fetch="https://github.com/OnePlusOSS" name="origin"/>
   <remote fetch="https://github.com/Bouteillepleine" name="Bouteillepleine"/>
-  <project remote="Bouteillepleine" name="AnyKernel3" path="AnyKernel3" revision="suite"/>
+  <project remote="Bouteillepleine" name="AnyKernel3" path="AnyKernel3" revision="gki-2.0"/>
   <default remote="clo-la" revision="dummy_revision" sync-c="true" sync-tags="false"/>
   <project remote="origin" name="android_kernel_common_oneplus_sm8750" path="kernel_platform/common" revision="0005dd55977209b7b58701018541cd82feb6d402">
     <linkfile dest="kernel_platform/.source_date_epoch_dir" src="."/>
