@@ -129,6 +129,21 @@ sed -i '/ksu_syscall_hook_init[[:space:]]*();/d' "$target" || true
 sed -i '/ksu_syscall_hook_exit[[:space:]]*();/d' "$target" || true
   fi
 
+  # SUSFS v2.3.0 deletes ksu_app_profile_init() outright - declaration, definition AND the
+  # call. The declaration/definition removal lands in app_profile.{c,h} (those hunks apply),
+  # but the call lives in an init.c hunk that rejects against SukiSU, so it survives as a
+  # call to an undeclared function and the build dies with
+  # -Werror=implicit-function-declaration. Drop the call, but only once the definition is
+  # genuinely gone, so older SUSFS versions that keep it are untouched.
+  if ! grep -Rqs '^[[:space:]]*\(void\|int\)[[:space:]]\+\(__init[[:space:]]\+\)\?ksu_app_profile_init[[:space:]]*(' "$root_dir" --include='*.c' 2>/dev/null; then
+sed -i '/^[[:space:]]*ksu_app_profile_init[[:space:]]*();[[:space:]]*$/d' "$target" || true
+if grep -q 'ksu_app_profile_init[[:space:]]*(' "$target"; then
+  echo "::error::ksu_app_profile_init() is called in $target but defined nowhere"
+  exit 1
+fi
+echo "  dropped ksu_app_profile_init() call (removed by SUSFS v2.3.0)"
+  fi
+
   if grep -nE 'ksu_lsm_hook_init|ksu_late_loaded|ksu_syscall_hook_manager_init|ksu_syscall_hook_manager_exit' "$target"; then
 echo "::error::Legacy SukiSU-incompatible symbols remain in $target"
 exit 1
