@@ -808,8 +808,11 @@ runs:
               aria_log_flags="--summary-interval=5"
           fi
           
+          # Do NOT send a spoofed desktop-browser User-Agent here: gitlab.com's abuse
+          # protection answers 403 to a Chrome UA on /-/archive/ URLs, which failed every
+          # susfs fetch in the matrix before SUSFS was ever applied. The same URL returns
+          # 200 with aria2c's own User-Agent, so just send the standard headers.
           local aria2_headers=(
-            "--header=User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             "--header=Accept: */*"
             "--header=Connection: keep-alive"
           )
@@ -836,13 +839,47 @@ runs:
                   fi
               fi
               
-              echo "⚠️ Attempt $attempt failed, clearing RAM and retrying..."
+              echo "⚠️ Attempt $attempt failed (re-running verbosely to show why)..."
+              aria2c -x1 -s1 -j1 -k1M --max-tries=1 -d /dev/shm -o "$archive_name.diag" \
+                --allow-overwrite=true "${aria2_headers[@]}" --summary-interval=0 "$download_url" 2>&1 | tail -5 || true
+              rm -f "/dev/shm/$archive_name.diag" 2>/dev/null
               rm -rf "$repo_name" "$shm_path" 2>/dev/null
               sleep 5
               attempt=$((attempt + 1))
           done
           
           echo "::error::All attempts failed for $url"
+          return 1
+        }
+        
+        # Fallback for when a host refuses its dynamic archive endpoint. Uses the git
+        # protocol instead, which is served by a different path; GitLab permits fetching a
+        # bare commit SHA, so this works whether $ref is a branch name or a resolved hash.
+        fetch_repo_via_git() {
+          local url="$1"
+          local ref="$2"
+          local dir="${3:-$(basename "$url" .git)}"
+          local max_attempts=3
+          local attempt=1
+          
+          while [ $attempt -le $max_attempts ]; do
+            echo "🔄 git fallback attempt $attempt/$max_attempts: $dir ($ref)"
+            rm -rf "$dir"
+            mkdir -p "$dir"
+            if git -C "$dir" init -q \
+               && git -C "$dir" remote add origin "$url" \
+               && git -C "$dir" fetch --depth 1 origin "$ref" \
+               && git -C "$dir" checkout -q FETCH_HEAD; then
+              echo "✅ Success: $dir fetched via git ($ref)"
+              return 0
+            fi
+            echo "❌ git fallback attempt $attempt failed"
+            rm -rf "$dir"
+            sleep $((attempt * 5))
+            attempt=$((attempt + 1))
+          done
+          
+          echo "💥 git fallback failed for $url ($ref)"
           return 1
         }
         
@@ -892,8 +929,11 @@ runs:
         if [ "${{ env.OP_SUSFS }}" = true ]; then
           echo "Using SUSFS branch/commit: $SUSFS_BRANCH"
           if ! retry_fetch_archive "https://gitlab.com/simonpunk/susfs4ksu.git" "$SUSFS_BRANCH"; then
-            echo "::error::Failed to fetch SUSFS archive after multiple attempts"
-            exit 1
+            echo "::warning::SUSFS archive fetch failed; falling back to the git protocol"
+            if ! fetch_repo_via_git "https://gitlab.com/simonpunk/susfs4ksu.git" "$SUSFS_BRANCH" "susfs4ksu"; then
+              echo "::error::Failed to fetch SUSFS via both the archive endpoint and git"
+              exit 1
+            fi
           fi
           echo "SUSFS_COMMIT_SHA=$SUSFS_BRANCH" >> $GITHUB_ENV
         fi
