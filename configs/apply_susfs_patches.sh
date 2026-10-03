@@ -38,11 +38,11 @@ echo "$susfs_version" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
 echo "SusFS Version: $susfs_version"
 
 case "$susfs_version" in
-  v2.1.0|v2.2.0)
+  v2.1.0|v2.2.0|v2.3.0)
     echo "Supported SUSFS version detected: $susfs_version"
     ;;
   *)
-    echo "::error::This workflow step supports SUSFS v2.1.0 and v2.2.0 only. Detected: $susfs_version"
+    echo "::error::This workflow step supports SUSFS v2.1.0, v2.2.0 and v2.3.0 only. Detected: $susfs_version"
     exit 1
     ;;
 esac
@@ -465,9 +465,31 @@ fi
   echo "✅ Fixed $target"
 }
 
+# SUSFS v2.3.0 note: the fixers below exist to rebuild SukiSU's sucompat API when
+# the enable patch's sucompat hunks REJECT (the SUSFS v2.1.0/v2.2.0 situation).
+# They reproduce the OLD manual-hook API, where faccessat/stat took
+# `const char __user **filename_user`. SUSFS v2.3.0 changed the kernel-side call
+# sites to `struct filename **`, and (after normalize_sukisu_to_official_baseline)
+# the patch now converts sucompat.c cleanly to exactly that API. Re-running these
+# fixers on an already-converted tree reverts it to the pt_regs implementation,
+# which leaves ksu_handle_faccessat()/ksu_handle_stat() declared but never defined
+# -> undefined reference from fs/open.c and fs/stat.c. So: stand down when the
+# v2.3.0 API is already in place.
+susfs_v230_sucompat_api_present() {
+  local c="$1/feature/sucompat.c"
+  [ -f "$c" ] || return 1
+  grep -q 'ksu_handle_faccessat(int \*dfd, struct filename \*\*filename' "$c" && \
+  grep -q 'ksu_handle_stat(int \*dfd, struct filename \*\*filename' "$c"
+}
+
 fix_sukisu_sucompat_api() {
   local base="$1"
   [ -d "$base" ] || return 0
+
+  if susfs_v230_sucompat_api_present "$base"; then
+    echo "ℹ️ SUSFS v2.3.0 sucompat API already in place in $base; skipping legacy rebuild"
+    return 0
+  fi
 
   local c="$base/feature/sucompat.c"
   local h="$base/feature/sucompat.h"
@@ -676,6 +698,11 @@ exit 1
 fix_sukisu_forced_execveat_link_symbols() {
   local base="$1"
   [ -d "$base" ] || return 0
+
+  if susfs_v230_sucompat_api_present "$base"; then
+    echo "ℹ️ SUSFS v2.3.0 sucompat API already in place in $base; skipping legacy rebuild"
+    return 0
+  fi
 
   local sucompat_c="$base/feature/sucompat.c"
   local sucompat_h="$base/feature/sucompat.h"
@@ -928,6 +955,11 @@ fix_sukisu_syscall_event_bridge() {
 
   local base
   base="$(dirname "$(dirname "$target")")"
+
+  if susfs_v230_sucompat_api_present "$base"; then
+    echo "ℹ️ SUSFS v2.3.0: syscall_event_bridge.c is no longer compiled; skipping"
+    return 0
+  fi
   local sucompat_c="$base/feature/sucompat.c"
 
   echo "Fixing syscall_event_bridge sucompat API in: $target"
@@ -1004,6 +1036,87 @@ fi
   echo "✅ Fixed $target"
 }
 
+# SUSFS replaces KernelSU's own syscall-hook machinery with its own in-kernel
+# (manual) hook call sites, so the enable patch drops the whole hook subsystem
+# from Kbuild. Through SUSFS v2.2.0 that hunk applied cleanly; on v2.3.0 it
+# REJECTS, purely because its context carries official's RISC-V arm of the
+# per-arch block, which SukiSU does not have. The hunk is NOT optional: leaving
+# these objects compiled keeps SukiSU's tracepoint/kprobe hooks live alongside
+# SUSFS's inline ones (double hooking) while the rest of the tree has already
+# been converted. Replicate the removal by hand, idempotently.
+#
+# infra/symbol_resolver.o and hook/arm64/patch_memory.o are deliberately NOT
+# handled here: fix_sukisu_linker_symbols re-adds them when their sources exist,
+# because SukiSU code outside the hook subsystem still wants find_kernel_symbol_exact
+# and ksu_patch_text. That reproduces the SUSFS v2.2.0 end state exactly.
+replicate_susfs_hook_subsystem_removal() {
+  local kbuild="$1"
+  [ -f "$kbuild" ] || return 0
+
+  if ! grep -qE '^kernelsu-objs \+= hook/(syscall_event_bridge|syscall_hook_manager|tp_marker|lsm_hook)\.o' "$kbuild"; then
+echo "  hook subsystem already absent from $kbuild"
+return 0
+  fi
+
+  echo "Replicating SUSFS hook-subsystem removal in: $kbuild"
+
+  sed -i \
+-e '/^kernelsu-objs += hook\/lsm_hook\.o$/d' \
+-e '/^kernelsu-objs += hook\/syscall_event_bridge\.o$/d' \
+-e '/^kernelsu-objs += hook\/syscall_hook_manager\.o$/d' \
+-e '/^kernelsu-objs += hook\/tp_marker\.o$/d' \
+"$kbuild"
+
+  # Drop the per-arch patch_memory/syscall_hook block (ARM64 / x86_64 / RISCV arms).
+  perl -0pi -e 's/^ifeq \(\$\(CONFIG_ARM64\),y\)\nkernelsu-objs \+= hook\/arm64\/patch_memory\.o\nkernelsu-objs \+= hook\/arm64\/syscall_hook\.o\n(?:else ifeq \([^\n]*\n(?:kernelsu-objs \+= hook\/[^\n]*\n)+)*endif\n//m' "$kbuild"
+
+  if grep -qE '^kernelsu-objs \+= hook/(arm64|x86_64|riscv64)/' "$kbuild"; then
+echo "::error::per-arch hook objects remain in $kbuild after SUSFS hook-subsystem removal"
+exit 1
+  fi
+
+  echo "✅ Hook subsystem removed from $kbuild"
+}
+
+# SUSFS v2.3.0's sucompat.c (taken from official KernelSU) installs the scoped
+# su-session fd via ksu_install_su_fd() in ksu_handle_post_execveat_sucompat().
+# SukiSU v4.2.0 predates official's permission-scoped driver fd and only has
+# ksu_install_fd(), so shim the name onto it: SukiSU has no fd-permission concept,
+# making the plain install the exact equivalent. Without this the vmlinux link
+# fails with an undefined reference.
+ensure_ksu_install_su_fd() {
+  local root="$1"
+  [ -d "$root" ] || return 0
+
+  grep -rqs 'ksu_install_su_fd' "$root" --include='*.c' || return 0
+
+  if grep -rqsE '^[a-z ]*int[[:space:]]+ksu_install_su_fd[[:space:]]*\(' "$root" --include='*.c'; then
+echo "  ksu_install_su_fd already defined"
+return 0
+  fi
+
+  local sc="$root/supercall/supercall.c"
+  local sh="$root/supercall/supercall.h"
+  [ -f "$sc" ] || return 0
+
+  cat >> "$sc" <<'EOF'
+
+// SukiSU compatibility: SUSFS v2.3.0 sucompat expects official KernelSU's
+// permission-scoped su-session fd. SukiSU has no fd-permission concept, so the
+// plain driver fd is the equivalent.
+int ksu_install_su_fd(void)
+{
+    return ksu_install_fd();
+}
+EOF
+
+  if [ -f "$sh" ] && ! grep -q 'ksu_install_su_fd' "$sh"; then
+sed -i 's|^int ksu_install_fd(void);|&\nint ksu_install_su_fd(void);|' "$sh"
+  fi
+
+  echo "✅ Added ksu_install_su_fd() shim to $sc"
+}
+
 fix_sukisu_linker_symbols() {
   echo "Applying SukiSU linker-symbol compatibility cleanup..."
 
@@ -1071,10 +1184,87 @@ fi
 }
 
 # =============================================================================
+# SUSFS v2.3.0 baseline normalisation
+#
+# susfs4ksu regenerates 10_enable_susfs_for_ksu.patch against official
+# tiann/KernelSU main (it applies there with zero rejects). SukiSU tracks that
+# tree closely, so most v2.3.0 rejects come from a handful of cosmetic deltas in
+# the hunks' CONTEXT rather than from real divergence. The biggest one: official
+# gained PT_REGS_SYSCALL_PARM1() for RISC-V (where syscall arg0 lives in orig_a0
+# because a0 is reused as the return slot); SukiSU dropped the RISC-V block and
+# with it the macro. On arm64/x86_64 __PT_SYSCALL_PARM1_REG == __PT_PARM1_REG, so
+# re-adding the macro and using it at the sites official uses it is an identity.
+#
+# Normalising these few lines lets sucompat.c, ksud_integration.c, adb_root.c and
+# ksu.h apply CLEANLY, instead of leaving half-converted files spliced together
+# from two architectures (which is what the raw rejects produce). Every edit is
+# guarded, so this is a no-op on trees that already match.
+# =============================================================================
+
+normalize_sukisu_to_official_baseline() {
+  local k="$1"
+  [ -d "$k" ] || return 0
+
+  # Only for v2.3.0. On v2.1.0/v2.2.0 the enable patch rejects on sucompat.c by
+  # design and fix_sukisu_sucompat_api rebuilds the old API; normalising there
+  # would change which hunks land and break that CI/device-proven path.
+  case "${susfs_version:-}" in
+v2.3.0) ;;
+*) echo "ℹ️ SUSFS ${susfs_version:-unknown}: skipping official-baseline normalisation (v2.3.0 only)"; return 0 ;;
+  esac
+
+  echo "Normalising SukiSU tree to the official-KernelSU baseline (SUSFS v2.3.0)"
+
+  if [ -f "$k/include/arch.h" ] && ! grep -q 'PT_REGS_SYSCALL_PARM1' "$k/include/arch.h"; then
+sed -i 's|^#define PT_REGS_PARM1(x).*|&\n#ifndef __PT_SYSCALL_PARM1_REG\n#define __PT_SYSCALL_PARM1_REG __PT_PARM1_REG\n#endif\n#define PT_REGS_SYSCALL_PARM1(x) (__PT_REGS_CAST(x)->__PT_SYSCALL_PARM1_REG)|' "$k/include/arch.h"
+echo "  arch.h: re-added PT_REGS_SYSCALL_PARM1 (identity on arm64/x86_64)"
+  fi
+
+  [ -f "$k/feature/adb_root.c" ] && sed -i \
+-e 's|do_ksu_adb_root_handle_execve((const char __user \*)PT_REGS_PARM1(regs)|do_ksu_adb_root_handle_execve((const char __user *)PT_REGS_SYSCALL_PARM1(regs)|' \
+"$k/feature/adb_root.c" || true
+
+  [ -f "$k/runtime/ksud_integration.c" ] && sed -i \
+-e 's|(const char __user \*)PT_REGS_PARM1(regs)|(const char __user *)PT_REGS_SYSCALL_PARM1(regs)|' \
+-e 's|unsigned int fd = PT_REGS_PARM1(regs);|unsigned int fd = PT_REGS_SYSCALL_PARM1(regs);|' \
+"$k/runtime/ksud_integration.c" || true
+
+  [ -f "$k/supercall/supercall.c" ] && sed -i \
+'s|int magic1 = (int)PT_REGS_PARM1(real_regs);|int magic1 = (int)PT_REGS_SYSCALL_PARM1(real_regs);|' \
+"$k/supercall/supercall.c" || true
+
+  if [ -f "$k/feature/sucompat.c" ]; then
+sed -i \
+  -e 's|(int)PT_REGS_PARM1(regs) != AT_FDCWD|(int)PT_REGS_SYSCALL_PARM1(regs) != AT_FDCWD|' \
+  -e 's|orig_regs\[0\] = regs->__PT_PARM1_REG;|orig_regs[0] = PT_REGS_SYSCALL_PARM1(regs);|' \
+  -e 's|regs->__PT_PARM1_REG = tmp_fd;|PT_REGS_SYSCALL_PARM1(regs) = tmp_fd;|' \
+  -e 's|regs->__PT_PARM1_REG = orig_regs\[0\];|PT_REGS_SYSCALL_PARM1(regs) = orig_regs[0];|' \
+  "$k/feature/sucompat.c"
+
+# Three context lines SukiSU dropped (official's scoped su-session fd). The
+# enable patch deletes this whole region, so restoring them only serves to make
+# the hunks apply; see ensure_ksu_install_su_fd for the symbol it pulls in.
+grep -q '#include "supercall/supercall.h"' "$k/feature/sucompat.c" || \
+  sed -i 's|^#include "hook/syscall_hook.h"|&\n#include "supercall/supercall.h"|' "$k/feature/sucompat.c"
+grep -q 'int su_fd = -1;' "$k/feature/sucompat.c" || \
+  sed -i 's|^    int tmp_fd;|    int su_fd = -1;\n&|' "$k/feature/sucompat.c"
+if ! grep -q 'ksu_install_su_fd' "$k/feature/sucompat.c"; then
+  perl -0pi -e 's/(        regs->__PT_PARM5_REG = orig_regs\[4\];\n    \})\n(    return ret;)/$1 else {\n        \/\/ Only grant the scoped driver capability after the selected root\n        \/\/ profile has been applied successfully.\n        su_fd = ksu_install_su_fd();\n        if (su_fd < 0) {\n            pr_warn("install su session fd failed: %d\\n", su_fd);\n        }\n    }\n$2/s' "$k/feature/sucompat.c"
+fi
+  fi
+
+  if [ -f "$k/include/ksu.h" ] && ! grep -q 'extern bool ksu_bundled' "$k/include/ksu.h"; then
+sed -i 's|^extern bool allow_shell;|&\n#ifdef MODULE\nextern bool ksu_bundled;\n#endif|' "$k/include/ksu.h"
+  fi
+}
+
+# =============================================================================
 # Patch KernelSU tree
 # =============================================================================
 
 cd "$KSU_FOLDER"
+
+normalize_sukisu_to_official_baseline "$KSU_FOLDER/kernel"
 
 patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
 
@@ -1087,6 +1277,9 @@ EXPECTED_SUKISU_REJECTS=(
   "kernel/hook/syscall_event_bridge.c.rej"
   "kernel/feature/sucompat.c.rej"
   "kernel/feature/sucompat.h.rej"
+  # v2.3.0: only hunk is pr_err/pr_info wording inside official's
+  # ksu_install_fd_with_permissions(), a function SukiSU does not have.
+  "kernel/supercall/supercall.c.rej"
 )
 
 if [ -n "$(find . -name '*.rej' -print -quit)" ]; then
@@ -1231,6 +1424,12 @@ fix_sukisu_dispatch_c           "drivers/kernelsu/supercall/dispatch.c"
 fix_sukisu_sucompat_api         "drivers/kernelsu"
 fix_sukisu_forced_execveat_link_symbols "drivers/kernelsu"
 fix_sukisu_syscall_event_bridge "drivers/kernelsu/hook/syscall_event_bridge.c"
+
+replicate_susfs_hook_subsystem_removal "$KSU_FOLDER/kernel/Kbuild"
+replicate_susfs_hook_subsystem_removal "drivers/kernelsu/Kbuild"
+ensure_ksu_install_su_fd "$KSU_FOLDER/kernel"
+ensure_ksu_install_su_fd "drivers/kernelsu"
+
 fix_sukisu_linker_symbols
 
 mkdir -p drivers/kernelsu/kpm/uapi include/uapi
@@ -1705,6 +1904,14 @@ for bridge in \
   if [ -f "$bridge" ]; then
 bridge_base="$(dirname "$(dirname "$bridge")")"
 bridge_sucompat_c="$bridge_base/feature/sucompat.c"
+
+# SUSFS v2.3.0 removes hook/syscall_event_bridge.o from Kbuild (SUSFS supplies its
+# own in-kernel hook call sites), so the file is left on disk but never compiled.
+# Its stale pt_regs sucompat calls are then irrelevant - don't fail the build over them.
+if susfs_v230_sucompat_api_present "$bridge_base"; then
+  echo "ℹ️ SUSFS v2.3.0: $bridge is not compiled; skipping bridge API validation"
+  continue
+fi
 
 if grep -q 'ksu_handle_stat_sucompat' "$bridge"; then
   if ! grep -qE '^[[:space:]]*long[[:space:]]+ksu_handle_stat_sucompat[[:space:]]*\(' "$bridge_sucompat_c" 2>/dev/null; then

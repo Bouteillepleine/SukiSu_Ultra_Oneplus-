@@ -44,7 +44,7 @@ on:
         description: 'Enter SukiSU build json'
         required: true
         type: string
-        default: '[{"type":"SUKISU","hash":"main"}]'
+        default: '[{"type":"SUKISU","hash":"v4.2.0"}]'
       optimize_level:
         description: "Compiler optimization level"
         required: true
@@ -136,7 +136,7 @@ jobs:
           input="${{ github.event.inputs.op_model }}"
           target_model="${{ github.event.inputs.op_target_model }}"
           ksu_options_raw='${{ github.event.inputs.ksu_options }}'
-          if ! ksu_options_normalized=$(echo "$ksu_options_raw" | jq -c 'map(if .type then .type |= ascii_upcase | if .hash == null then .hash = "v4.1.3" else . end else error("No type found") end)' 2>&1); then
+          if ! ksu_options_normalized=$(echo "$ksu_options_raw" | jq -c 'map(if .type then .type |= ascii_upcase | if .hash == null then .hash = "v4.2.0" else . end else error("No type found") end)' 2>&1); then
             echo "::error::ksu_options validation failed: $ksu_options_normalized"
             exit 1
           fi
