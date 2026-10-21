@@ -103,7 +103,10 @@ fix_sukisu_init_c() {
 
   echo "Fixing SukiSU init compatibility in: $target"
 
+  # The enable patch drops the hook/lsm_hook.h include from init.c; both calls have to
+  # go with it or they are implicit declarations.
   sed -i '/ksu_lsm_hook_init[[:space:]]*();/d' "$target" || true
+  sed -i '/ksu_lsm_hook_exit[[:space:]]*();/d' "$target" || true
 
   sed -i \
 -e 's/\bksu_syscall_hook_manager_init[[:space:]]*(/ksu_syscall_hook_init(/g' \
