@@ -278,6 +278,70 @@ fix_sukisu_ksud_integration_c() {
 
   neutralize_ksu_late_loaded "$target"
 
+  # SUSFS v2.3.0 rewrites ksu_handle_execveat_ksud() to the hooked signature. ksud.h and
+  # sucompat.c take the new one, but the hunk converting the definition rejects against
+  # SukiSU, which still has the syscall-table form plus its own module-blacklist and
+  # execve-hook-stop calls. Convert it here and keep those two. Idempotent.
+  KSUD_INTEGRATION_C="$target" python3 <<'KSUDPY'
+import os, re, sys
+from pathlib import Path
+
+path = Path(os.environ["KSUD_INTEGRATION_C"])
+text = path.read_text()
+
+if "int ksu_handle_execveat_ksud(int *fd" in text:
+    print("ksud_integration.c already carries the hooked signature")
+    sys.exit(0)
+
+m = re.search(r"void ksu_handle_execveat_ksud\(const char \*path, struct user_arg_ptr \*argv\)\n\{", text)
+if not m:
+    print("::error::could not find ksu_handle_execveat_ksud() to convert")
+    sys.exit(1)
+
+# body spans to the closing brace at column 0
+end = text.index("\n}\n", m.start()) + 3
+body = text[m.start():end]
+
+new_head = """int ksu_handle_execveat_ksud(int *fd, struct filename **filename_ptr,
+                             struct user_arg_ptr *argv,
+                             struct user_arg_ptr *envp, int *flags)
+{
+    struct filename *filename;
+"""
+body = body.replace(m.group(0) + "\n", new_head, 1)
+
+# the two "once" flags become the static keys susfs defines
+body = body.replace("    static bool first_zygote = true;\n", "")
+body = body.replace("    static bool init_second_stage_executed = false;\n", "")
+body = body.replace("""    static const char system_bin_init[] = "/system/bin/init";
+""", """    static const char system_bin_init[] = "/system/bin/init";
+
+    if (!filename_ptr)
+        return 0;
+
+    filename = *filename_ptr;
+    if (IS_ERR(filename))
+        return 0;
+""", 1)
+body = body.replace("memcmp(path, system_bin_init", "memcmp(filename->name, system_bin_init")
+body = body.replace("memcmp(path, app_process", "memcmp(filename->name, app_process")
+body = body.replace("if (!init_second_stage_executed && check_argv",
+                    "if (static_branch_unlikely(&is_init_second_stage_not_executed) && check_argv")
+body = body.replace("            init_second_stage_executed = true;\n",
+                    "            static_branch_disable(&is_init_second_stage_not_executed);\n")
+body = body.replace("if (unlikely(first_zygote && ", "if (unlikely(static_branch_unlikely(&is_first_zygote) && ")
+body = body.replace("            first_zygote = false;\n",
+                    "            static_branch_disable(&is_first_zygote);\n")
+body = body.replace('second_stage: %d\\n", init_second_stage_executed)',
+                    'second_stage: %d\\n", !static_key_enabled(&is_init_second_stage_not_executed))')
+body = body.rstrip("\n")
+assert body.endswith("}")
+body = body[:-1] + "\n    return 0;\n}\n"
+
+path.write_text(text[:m.start()] + body + text[end:])
+print("ksu_handle_execveat_ksud() converted to the hooked signature")
+KSUDPY
+
   if ! grep -q 'ksu_no_custom_rc' "$target"; then
 echo "ℹ️ ksu_no_custom_rc not referenced in $target"
 return 0
@@ -1285,6 +1349,9 @@ patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for
 
 EXPECTED_SUKISU_REJECTS=(
   "kernel/core/init.c.rej"
+  # v2.3.0: the ksu_handle_execveat_ksud() rewrite; fix_sukisu_ksud_integration_c()
+  # converts the definition instead, keeping SukiSU's own calls.
+  "kernel/runtime/ksud_integration.c.rej"
   "kernel/feature/selinux_hide.c.rej"
   "kernel/runtime/boot_event.c.rej"
   "kernel/supercall/dispatch.c.rej"
