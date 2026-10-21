@@ -402,8 +402,16 @@ fix_sukisu_selinux_hide_c() {
 
     perl -0pi -e 's/\n[ \t]*ret = ksu_lsm_hook\(&selinux_setprocattr_hook\);\n[ \t]*if \(ret\) \{\n[^}]*\n[ \t]*goto unhook;\n[ \t]*\}\n//' "$target" || true
 
-    # its only caller was the hook struct; keep the body but silence -Wunused-function
-    sed -i 's/^static int __nocfi my_setprocattr(/static int __maybe_unused __nocfi my_setprocattr(/' "$target" || true
+    # my_setprocattr() was reachable only through that struct and returns through
+    # selinux_setprocattr_hook.original, so it goes with it, typedef included.
+    perl -0pi -e 's/typedef int \(\*setprocattr_fn\)\([^;]*;\n//' "$target" || true
+    perl -0pi -e 's/static int __nocfi my_setprocattr\(.*?\n\}\n\n//s' "$target" || true
+
+    if grep -q 'my_setprocattr\|setprocattr_fn\|selinux_setprocattr_hook' "$target"; then
+      echo "::error::setprocattr remnants remain in $target"
+      grep -n 'my_setprocattr\|setprocattr_fn\|selinux_setprocattr_hook' "$target"
+      exit 1
+    fi
 
     if grep -q 'ksu_lsm_hook\|ksu_lsm_unhook\|KSU_LSM_HOOK_INIT' "$target"; then
       echo "::error::LSM hook references remain in $target"
@@ -415,7 +423,7 @@ fix_sukisu_selinux_hide_c() {
   sed -i \
 -e 's/^static int security_context_to_sid_with_policy(/int security_context_to_sid_with_policy(/' \
 -e 's/^static int security_sid_to_context_with_policy(/int security_sid_to_context_with_policy(/' \
--e 's/^static void security_compute_av_user_with_policy(/void security_compute_av_user_with_policy(/' \
+-e 's/^static void \(__nocfi \)\?security_compute_av_user_with_policy(/void \1security_compute_av_user_with_policy(/' \
 -e 's/^static bool ksu_selinux_hide_running/bool ksu_selinux_hide_running/' \
 "$target" || true
 
