@@ -292,6 +292,19 @@ from pathlib import Path
 path = Path(os.environ["KSUD_INTEGRATION_C"])
 text = path.read_text()
 
+# The hunk that adds these rejects whenever the includes above it have been normalised,
+# while the hunks that *use* them apply - so define them here when they are missing.
+keys = ("ksu_is_init_rc_hook_enabled", "ksu_is_input_hook_enabled",
+        "is_init_second_stage_not_executed", "is_first_zygote")
+missing = [k for k in keys if f"DEFINE_STATIC_KEY_TRUE({k})" not in text]
+if missing:
+    last_include = max(m.end() for m in re.finditer(r'^#include [^\n]*\n', text, re.M))
+    text = (text[:last_include] + "\n"
+            + "".join(f"DEFINE_STATIC_KEY_TRUE({k});\n" for k in missing)
+            + text[last_include:])
+    path.write_text(text)
+    print("defined missing static keys: " + ", ".join(missing))
+
 if "int ksu_handle_execveat_ksud(int *fd" in text:
     print("ksud_integration.c already carries the hooked signature")
     sys.exit(0)
