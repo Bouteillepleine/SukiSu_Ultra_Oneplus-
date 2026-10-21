@@ -388,6 +388,30 @@ fix_sukisu_selinux_hide_c() {
 
   echo "Fixing SukiSU selinux_hide compatibility in: $target"
 
+  # replicate_susfs_hook_subsystem_removal() drops hook/lsm_hook.o and the per-arch
+  # patch objects, so SukiSU's setprocattr LSM hook has no implementation left to link
+  # against. Drop the registration; the rest of selinux_hide (its text patching) stands
+  # on its own. Idempotent.
+  if grep -q 'KSU_LSM_HOOK_INIT' "$target"; then
+    echo "  dropping the setprocattr LSM hook (hook subsystem is removed)"
+    sed -i \
+-e '/^struct ksu_lsm_hook selinux_setprocattr_hook = KSU_LSM_HOOK_INIT(/d' \
+-e '/^static int my_setprocattr(const char \*name, void \*value, size_t size);$/d' \
+-e '/^[[:space:]]*ksu_lsm_unhook(&selinux_setprocattr_hook);$/d' \
+"$target" || true
+
+    perl -0pi -e 's/\n[ \t]*ret = ksu_lsm_hook\(&selinux_setprocattr_hook\);\n[ \t]*if \(ret\) \{\n[^}]*\n[ \t]*goto unhook;\n[ \t]*\}\n//' "$target" || true
+
+    # its only caller was the hook struct; keep the body but silence -Wunused-function
+    sed -i 's/^static int __nocfi my_setprocattr(/static int __maybe_unused __nocfi my_setprocattr(/' "$target" || true
+
+    if grep -q 'ksu_lsm_hook\|ksu_lsm_unhook\|KSU_LSM_HOOK_INIT' "$target"; then
+      echo "::error::LSM hook references remain in $target"
+      grep -n 'ksu_lsm_hook\|ksu_lsm_unhook\|KSU_LSM_HOOK_INIT' "$target"
+      exit 1
+    fi
+  fi
+
   sed -i \
 -e 's/^static int security_context_to_sid_with_policy(/int security_context_to_sid_with_policy(/' \
 -e 's/^static int security_sid_to_context_with_policy(/int security_sid_to_context_with_policy(/' \
