@@ -1607,6 +1607,32 @@ rm -f mm/memory.c.rej
 handled_rejects=1
   fi
 
+  if [ -f fs/exec.c.rej ] && grep -q 'susfs_def.h' fs/exec.c.rej; then
+    echo "Handling known SUSFS fs/exec.c include reject..."
+
+    # The upstream hunk anchors on #include <linux/dma-buf.h>, a GKI line OnePlus trees
+    # do not carry, so only the susfs_def.h include is left unapplied.
+    if grep -q '#include <linux/susfs_def.h>' fs/exec.c; then
+      echo "SUSFS header already present in fs/exec.c"
+    elif grep -q '#include <linux/ksm.h>' fs/exec.c; then
+      sed -i '/#include <linux\/ksm.h>/a #ifdef CONFIG_KSU_SUSFS\n#include <linux\/susfs_def.h>\n#endif' fs/exec.c
+    elif grep -q '#include <linux/rseq.h>' fs/exec.c; then
+      sed -i '/#include <linux\/rseq.h>/a #ifdef CONFIG_KSU_SUSFS\n#include <linux\/susfs_def.h>\n#endif' fs/exec.c
+    else
+      echo "::error::Could not find a safe include anchor in fs/exec.c"
+      cat fs/exec.c.rej
+      exit 1
+    fi
+
+    if ! grep -q '#include <linux/susfs_def.h>' fs/exec.c; then
+      echo "::error::Fallback did not add the SUSFS include to fs/exec.c"
+      exit 1
+    fi
+
+    rm -f fs/exec.c.rej
+    handled_rejects=1
+  fi
+
   if [ -f fs/proc/task_mmu.c.rej ] && grep -q 'CONFIG_KSU_SUSFS_SUS_MAP' fs/proc/task_mmu.c.rej; then
 echo "Handling known SUSFS fs/proc/task_mmu.c show_smaps_rollup reject..."
 
