@@ -421,6 +421,37 @@ fix_sukisu_selinux_hide_c() {
       echo "::error::my_setprocattr() was not exported in $target"; exit 1; }
   fi
 
+  # Same shape: the patch deletes hook_selinux_status_open()'s definition while its
+  # forward declaration and its caller stay. Everything it touches survives.
+  if grep -q '^static void hook_selinux_status_open();' "$target" && \
+     ! grep -q '^static void hook_selinux_status_open()$' "$target"; then
+    echo "  restoring hook_selinux_status_open()"
+    cat >> "$target" <<'STATUSEOF'
+
+static void hook_selinux_status_open()
+{
+    if (orig_sel_open_handle_status)
+        return;
+    if (!sel_open_handle_status_slot) {
+        struct file_operations *ops = find_kernel_symbol_exact("sel_handle_status_ops");
+        if (!ops) {
+            pr_err("selinux_hide: sel_handle_status_ops not found, fake status will not work\n");
+            return;
+        }
+        sel_open_handle_status_slot = &ops->open;
+    }
+    sel_open_handle_status_fn new_fn = my_sel_open_handle_status;
+    orig_sel_open_handle_status = *sel_open_handle_status_slot;
+    int ret = ksu_patch_text(sel_open_handle_status_slot, &new_fn, sizeof(new_fn), KSU_PATCH_TEXT_FLUSH_DCACHE);
+    if (ret) {
+        pr_err("selinux_hide: init: patch_text sel_open_handle_status err: %d\n", ret);
+        sel_open_handle_status_slot = NULL;
+        orig_sel_open_handle_status = NULL;
+    }
+}
+STATUSEOF
+  fi
+
   # The enable patch deletes these two entry points, but selinux_hide.h still declares
   # them and ksud_integration.c / boot_event.c still call them. Everything they touch
   # (initialize_fake_status, fake_status, fake_status_initialize_key) survives.
