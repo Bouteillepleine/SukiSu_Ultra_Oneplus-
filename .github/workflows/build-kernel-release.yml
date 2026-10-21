@@ -102,7 +102,7 @@ on:
 
 jobs:
   set-op-model:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
       device_count: ${{ steps.set-matrix.outputs.count }}
@@ -561,7 +561,7 @@ jobs:
 
   prepare_ccache:
     name: Prepare ccache binary (download once)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       # Download the custom ccache binary ONCE for the whole matrix and share it as
       # an artifact. Previously every parallel matrix job curl'd the same GitHub raw
@@ -603,7 +603,7 @@ jobs:
       !cancelled() &&
       needs.set-op-model.result == 'success' &&
       (needs.mirror_toolchain.result == 'success' || needs.mirror_toolchain.result == 'skipped')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.set-op-model.outputs.matrix) }}
@@ -865,7 +865,7 @@ jobs:
     name: 📋 Build report
     needs: [set-op-model, build]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -900,7 +900,7 @@ jobs:
 
   trigger-release:
     needs: [set-op-model, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: |
       !cancelled() &&
       inputs.make_release == true &&
