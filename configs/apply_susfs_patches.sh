@@ -285,6 +285,10 @@ fix_sukisu_ksud_integration_c() {
   # sucompat.c take the new one, but the hunk converting the definition rejects against
   # SukiSU, which still has the syscall-table form plus its own module-blacklist and
   # execve-hook-stop calls. Convert it here and keep those two. Idempotent.
+  # ksu_stop_ksud_execve_hook() lives in hook/syscall_event_bridge.c, which SUSFS stops
+  # compiling; the zygote path simply has no hook to stop any more.
+  sed -i '/^[[:space:]]*ksu_stop_ksud_execve_hook();$/d' "$target" || true
+
   KSUD_INTEGRATION_C="$target" python3 <<'KSUDPY'
 import os, re, sys
 from pathlib import Path
@@ -388,36 +392,60 @@ fix_sukisu_selinux_hide_c() {
 
   echo "Fixing SukiSU selinux_hide compatibility in: $target"
 
-  # replicate_susfs_hook_subsystem_removal() drops hook/lsm_hook.o and the per-arch
-  # patch objects, so SukiSU's setprocattr LSM hook has no implementation left to link
-  # against. Drop the registration; the rest of selinux_hide (its text patching) stands
-  # on its own. Idempotent.
+  # SUSFS v2.3.0 calls my_setprocattr() from the kernel's own selinux_setprocattr hook
+  # and removes SukiSU's LSM hook subsystem (replicate_susfs_hook_subsystem_removal drops
+  # hook/lsm_hook.o). Keep the function, export it, and let it ask the caller to run the
+  # stock handler instead of chaining through the deleted hook. Idempotent.
   if grep -q 'KSU_LSM_HOOK_INIT' "$target"; then
-    echo "  dropping the setprocattr LSM hook (hook subsystem is removed)"
+    echo "  adapting setprocattr to the SUSFS kernel-side hook"
     sed -i \
 -e '/^struct ksu_lsm_hook selinux_setprocattr_hook = KSU_LSM_HOOK_INIT(/d' \
 -e '/^static int my_setprocattr(const char \*name, void \*value, size_t size);$/d' \
 -e '/^[[:space:]]*ksu_lsm_unhook(&selinux_setprocattr_hook);$/d' \
+-e 's/^static int __nocfi my_setprocattr(/int __nocfi my_setprocattr(/' \
 "$target" || true
 
     perl -0pi -e 's/\n[ \t]*ret = ksu_lsm_hook\(&selinux_setprocattr_hook\);\n[ \t]*if \(ret\) \{\n[^}]*\n[ \t]*goto unhook;\n[ \t]*\}\n//' "$target" || true
 
-    # my_setprocattr() was reachable only through that struct and returns through
-    # selinux_setprocattr_hook.original, so it goes with it, typedef included.
+    # -ENOSYS means "not handled here": the SUSFS hook then runs stock selinux_setprocattr(),
+    # which is exactly what the LSM chain used to do after this function validated.
+    perl -0pi -e 's/[ \t]*return \(\(setprocattr_fn\)selinux_setprocattr_hook\.original\)\(name, value, size\);/    return -ENOSYS;/' "$target" || true
     perl -0pi -e 's/typedef int \(\*setprocattr_fn\)\([^;]*;\n//' "$target" || true
-    perl -0pi -e 's/static int __nocfi my_setprocattr\(.*?\n\}\n\n//s' "$target" || true
 
-    if grep -q 'my_setprocattr\|setprocattr_fn\|selinux_setprocattr_hook' "$target"; then
-      echo "::error::setprocattr remnants remain in $target"
-      grep -n 'my_setprocattr\|setprocattr_fn\|selinux_setprocattr_hook' "$target"
+    if grep -q 'ksu_lsm_hook\|ksu_lsm_unhook\|KSU_LSM_HOOK_INIT\|setprocattr_fn\|selinux_setprocattr_hook' "$target"; then
+      echo "::error::LSM hook remnants remain in $target"
+      grep -n 'ksu_lsm_hook\|ksu_lsm_unhook\|KSU_LSM_HOOK_INIT\|setprocattr_fn\|selinux_setprocattr_hook' "$target"
       exit 1
     fi
+    grep -q '^int __nocfi my_setprocattr(' "$target" || {
+      echo "::error::my_setprocattr() was not exported in $target"; exit 1; }
+  fi
 
-    if grep -q 'ksu_lsm_hook\|ksu_lsm_unhook\|KSU_LSM_HOOK_INIT' "$target"; then
-      echo "::error::LSM hook references remain in $target"
-      grep -n 'ksu_lsm_hook\|ksu_lsm_unhook\|KSU_LSM_HOOK_INIT' "$target"
-      exit 1
-    fi
+  # The enable patch deletes these two entry points, but selinux_hide.h still declares
+  # them and ksud_integration.c / boot_event.c still call them. Everything they touch
+  # (initialize_fake_status, fake_status, fake_status_initialize_key) survives.
+  if ! grep -q 'void ksu_selinux_hide_handle_second_stage' "$target"; then
+    echo "  restoring the selinux_hide second-stage / post-fs-data entry points"
+    cat >> "$target" <<'SELINUXEOF'
+
+void ksu_selinux_hide_handle_second_stage()
+{
+    initialize_fake_status();
+    if (fake_status) {
+        static_key_disable(&fake_status_initialize_key.key);
+    } else {
+        pr_warn("selinux_hide: fake status need late initialization\n");
+    }
+}
+
+void ksu_selinux_hide_handle_post_fs_data()
+{
+    static_key_disable(&fake_status_initialize_key.key);
+    if (!fake_status) {
+        pr_err("selinux_hide: fake status is not initialized after post-fs-data!\n");
+    }
+}
+SELINUXEOF
   fi
 
   sed -i \
@@ -1720,6 +1748,23 @@ fi
 
 rm -f mm/memory.c.rej
 handled_rejects=1
+  fi
+
+  # SUSFS v2.3.0's fs/exec.c hunks call KernelSU-Next's preinit runner, which SukiSU does
+  # not have; upstream guards every one of those with #ifndef KSU_NO_PREINIT.
+  if grep -q 'ksu_setup_preinit_file' fs/exec.c && ! grep -q '^#define KSU_NO_PREINIT' fs/exec.c; then
+    echo "Defining KSU_NO_PREINIT (SukiSU has no preinit runner)"
+    sed -i '1i #define KSU_NO_PREINIT' fs/exec.c
+  fi
+
+  # SUSFS routes selinux_setprocattr through SukiSU's my_setprocattr(), which validates
+  # against the backup policy and then wants the stock handler to do the work. It now
+  # reports that with -ENOSYS, so fall through instead of returning it to userspace.
+  if grep -q 'return my_setprocattr(name, value, size);' security/selinux/hooks.c; then
+    echo "Teaching handle_selinux_setprocattr() to fall through on -ENOSYS"
+    perl -0pi -e 's/\t\treturn my_setprocattr\(name, value, size\);/\t\t{\n\t\t\tint ksu_ret = my_setprocattr(name, value, size);\n\n\t\t\tif (ksu_ret != -ENOSYS)\n\t\t\t\treturn ksu_ret;\n\t\t}/' security/selinux/hooks.c
+    grep -q 'ksu_ret != -ENOSYS' security/selinux/hooks.c || {
+      echo "::error::could not rewrite handle_selinux_setprocattr()"; exit 1; }
   fi
 
   if [ -f fs/exec.c.rej ] && grep -q 'susfs_def.h' fs/exec.c.rej; then
